@@ -1,211 +1,324 @@
-# StreamVault — Complete Architecture & System Design
+# StreamVault — Architecture & System Design
 
-> Private Video Streaming Service · Rust · Axum · SQLite · HLS · Docker
-
----
-
-## Table of Contents
-
-1. [Executive Summary](#1-executive-summary)
-2. [System Architecture](#2-system-architecture)
-3. [Core Design Decisions](#3-core-design-decisions--rationale)
-4. [Full Technology Stack](#4-full-technology-stack)
-5. [Alternative Approaches & Trade-offs](#5-alternative-approaches--trade-offs)
-6. [Deployment Architectures](#6-deployment-architectures)
-7. [Horizontal Scaling Strategies](#7-horizontal-scaling-strategies)
-8. [Optimization with $1,000/Month Budget](#8-optimization-roadmap-with-1000month-budget)
-9. [Platform Comparisons](#9-platform-comparisons)
-10. [Security Considerations](#10-security-considerations)
-11. [Known Limitations & Future Work](#11-known-limitations--future-work)
-12. [Summary](#12-architecture-summary)
+> **Audience:** Engineers joining the project, evaluators, or anyone making infrastructure decisions.  
+> **Based on:** The working Docker Compose deployment — every decision documented here is reflected in the actual code.
 
 ---
 
-## 1. Executive Summary
+## Contents
 
-StreamVault is a minimal, anonymous video streaming service designed around a single priority: getting a video from upload to playable as fast as possible. Every architectural decision flows from this principle.
-
-The system is built in three layers: a Rust/Axum HTTP backend that handles uploads and streaming, a vanilla JavaScript single-page frontend served by nginx, and a SQLite metadata store. There is no authentication layer, no transcoding on the hot path, and no external service dependencies for the core flow.
-
-**The key insight:** serving a raw video file with HTTP byte-range support is both the simplest and the fastest path to streaming. A browser's native `<video>` element handles buffering and seeking automatically once byte-range responses are in place. HLS transcoding runs in the background to improve adaptive playback quality — it is an enhancement, not a requirement.
-
-| Property | Value |
-|---|---|
-| Purpose | Anonymous private video upload and streaming |
-| Primary stack | Rust (Axum 0.7), Vanilla JS frontend, SQLite via SQLx |
-| Max upload size | 1 GB per video |
-| Supported formats | MP4, WebM, MOV, AVI, MKV, MPEG-TS, MPEG |
-| Authentication | None — anonymous uploads, token-based sharing |
-| Time-to-stream | < 1 second after upload completes (HTTP Range mode) |
-| HLS ready time | Seconds (background remux, no re-encode) |
-| Deployment | Docker Compose — single command startup |
-| Free tier cost | $0/month (Fly.io + Tigris Object Storage) |
-| $1,000/month budget | Full production stack with CDN, managed DB, auto-scaling |
+1. [System Overview](#1-system-overview)
+2. [Component Architecture](#2-component-architecture)
+3. [Data Model](#3-data-model)
+4. [Request Flows](#4-request-flows)
+5. [Design Decisions](#5-design-decisions)
+6. [Technology Choices & Alternatives](#6-technology-choices--alternatives)
+7. [Deployment Tiers](#7-deployment-tiers)
+8. [Scaling](#8-scaling)
+9. [The $1,000/Month Stack](#9-the-1000month-stack)
+10. [Security](#10-security)
+11. [Observability](#11-observability)
+12. [Known Issues & Roadmap](#12-known-issues--roadmap)
 
 ---
 
-## 2. System Architecture
+## 1. System Overview
 
-### 2.1 High-Level Component Map
+StreamVault solves one problem: upload a video, get a link, share it. No accounts, no processing delays, no quality degradation.
+
+The design is ordered by priority:
+
+1. **Time-to-stream** — video must be watchable the moment the upload write completes
+2. **Simplicity** — every component is replaceable without touching the others
+3. **Cost efficiency** — runs at $0 on free-tier infrastructure for personal use
+4. **Horizontal scalability** — designed to scale out, even if not deployed that way today
+
+### What It Does
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        Browser                          │
-└───────────────────┬─────────────────────────────────────┘
-                    │ HTTP / HTTPS
-┌───────────────────▼─────────────────────────────────────┐
-│                  nginx (alpine)                         │
-│  • Serves static index.html (SPA)                       │
-│  • Proxies /api/* → backend:3000                        │
-│  • proxy_buffering off (critical for streaming)         │
-│  • client_max_body_size 1100M                           │
-└───────────────────┬─────────────────────────────────────┘
-                    │ Internal Docker network
-┌───────────────────▼─────────────────────────────────────┐
-│              Rust / Axum 0.7 (backend)                  │
-│  • POST /api/upload  — multipart stream to disk         │
-│  • GET  /api/stream/:token — HTTP Range streaming       │
-│  • GET  /api/hls/:token/* — HLS segment serving         │
-│  • GET  /api/videos[/:token] — metadata API             │
-│  • GET  /health — Docker healthcheck endpoint           │
-└──────────┬─────────────────────┬───────────────────────-┘
-           │                     │
-┌──────────▼──────────┐ ┌────────▼────────────────────────┐
-│  SQLite (via SQLx)  │ │  Docker Volume /data/uploads    │
-│  • videos table     │ │  • raw uploaded video files     │
-│  • token index      │ │  • hls/<token>/*.ts segments    │
-│  • hls_ready flag   │ │  • hls/<token>/playlist.m3u8   │
-└─────────────────────┘ └─────────────────────────────────┘
-                    │
-        ┌───────────▼───────────┐
-        │  FFmpeg (subprocess)  │
-        │  • -c:v copy remux    │
-        │  • 2-second segments  │
-        │  • runs in background │
-        └───────────────────────┘
+User uploads video (up to 1GB)
+  → system stores it on disk
+  → generates a random 8-char token
+  → returns a shareable URL immediately
+  → background: remuxes to HLS segments
+
+Anyone with the URL
+  → browser streams via HTTP Range requests
+  → or via HLS once background transcode completes
 ```
 
-| Component | Technology & Role |
-|---|---|
-| API Server | Rust + Axum 0.7 — upload ingestion, byte-range streaming, HLS segment serving, metadata API |
-| Frontend | Vanilla JS SPA — upload form with XHR progress, video player, shareable watch page |
-| Reverse Proxy | nginx alpine — TLS termination, static file serving, API proxy with buffering disabled |
-| Metadata Store | SQLite via SQLx — video tokens, filenames, content types, HLS readiness flag |
-| File Storage | Local filesystem (Docker volume) — raw uploaded files + HLS segment directories |
-| Transcoder | FFmpeg subprocess — background HLS remux (`-c:v copy`), runs after upload completes |
-| Orchestration | Docker Compose — two services (backend + frontend), one named volume for video data |
+### What It Deliberately Does Not Do
+
+- No user accounts or authentication
+- No transcoding on the upload hot path
+- No thumbnail generation, duration extraction, or format conversion
+- No expiry or access revocation
+- No search or content discovery
+
+These are deliberate omissions. Resolution paths for each are in [Section 12](#12-known-issues--roadmap).
 
 ---
 
-### 2.2 Full Request Lifecycle
+## 2. Component Architecture
 
-#### Upload Path
-
-```
-Browser
-  │
-  │  POST /api/upload (multipart/form-data)
-  ▼
-nginx
-  │  proxy_request_buffering off → bytes flow through immediately
-  ▼
-Axum (DefaultBodyLimit::disable() on this route)
-  │  Multipart stream → write chunks to disk (~64KB at a time)
-  │  Track total_bytes → reject if > 1GB
-  │
-  ├─→ SQLite: INSERT video row (token, filename, content_type, size_bytes)
-  │
-  ├─→ Return JSON { token, share_url, stream_url } ← VIDEO IS PLAYABLE NOW
-  │
-  └─→ tokio::spawn → FFmpeg HLS transcode (background, non-blocking)
-```
-
-1. Browser sends multipart/form-data POST to `/api/upload`
-2. nginx forwards bytes immediately — `proxy_request_buffering off` prevents nginx from buffering the full body
-3. Axum streams chunks directly to disk — peak memory is ~64KB regardless of file size
-4. Once write flushes, Axum generates a token, inserts metadata into SQLite, and returns the share URL. **The video is now streamable.**
-5. `tokio::spawn` fires the FFmpeg HLS transcode — the upload response is already sent, user doesn't wait
-
-#### Streaming Path (HTTP Range)
+### Runtime Topology
 
 ```
-Browser <video src="/api/stream/:token">
-  │
-  │  GET /api/stream/:token
-  │  Range: bytes=0-1048575
-  ▼
-Axum
-  │  Look up filename in SQLite
-  │  Open file, seek to byte offset
-  │  Stream exactly requested bytes via ReaderStream
-  │
-  └→  206 Partial Content
-      Content-Range: bytes 0-1048575/524288000
-      Accept-Ranges: bytes
+                      ┌────────────────────────┐
+                      │        Browser         │
+                      └──────────┬─────────────┘
+                                 │ HTTP :80
+                      ┌──────────▼─────────────┐
+                      │     nginx (alpine)      │
+                      │                        │
+                      │  GET /          ──────────→ index.html (static SPA)
+                      │  GET /watch/*   ──────────→ index.html (SPA fallback)
+                      │  /api/*         ──────────→ proxy → backend:3000
+                      │                        │
+                      │  proxy_buffering off    │  ← critical for streaming
+                      │  client_max_body_size   │
+                      │    1100M               │
+                      └──────────┬─────────────┘
+                   Docker internal network
+                      ┌──────────▼─────────────┐
+                      │    Rust / Axum 0.7      │
+                      │    (backend:3000)       │
+                      │                        │
+                      │  POST /api/upload       │
+                      │  GET  /api/stream/:tok  │
+                      │  GET  /api/hls/:tok/*   │
+                      │  GET  /api/videos[/:t]  │
+                      │  GET  /health           │
+                      └───────┬──────────┬──────┘
+                              │          │
+            ┌─────────────────▼──┐  ┌────▼───────────────────┐
+            │  SQLite             │  │  Filesystem             │
+            │  /app/              │  │  Docker volume          │
+            │  streamvault.db     │  │  /data/uploads/         │
+            │                    │  │                         │
+            │  videos table      │  │  {uuid}.mp4             │
+            │  token index       │  │  hls/{token}/           │
+            │  hls_ready flag    │  │    playlist.m3u8        │
+            └────────────────────┘  │    seg000.ts ...        │
+                                    └─────────────────────────┘
+                                              ▲
+                                   ┌──────────┴──────────┐
+                                   │  FFmpeg subprocess   │
+                                   │  (background task)   │
+                                   │  -c:v copy           │
+                                   │  -hls_time 2         │
+                                   └─────────────────────-┘
 ```
 
-1. Browser opens `/watch/:token`, JS fetches `/api/videos/:token` for metadata
-2. `<video>` element points at `/api/stream/:token`, browser sends `Range: bytes=0-` header
-3. Axum seeks to the requested offset and streams exactly the requested bytes
-4. When the user seeks to an unloaded position, browser sends a new Range request — Axum seeks and streams from there, no re-download
-
-#### HLS Path (Post-Transcode)
+### Codebase Map
 
 ```
-FFmpeg (background)
-  │  -i input.mp4 -c:v copy -c:a aac -hls_time 2
-  │
-  └→  /data/uploads/hls/:token/
+backend/src/
+├── main.rs        Entry point. Builds the Axum router, wires AppState,
+│                  binds the TCP listener. Creates upload dir and DB parent
+│                  dir at startup before anything else runs.
+│
+├── db.rs          All database interaction. SqlitePool wrapped in a
+│                  Database struct. Schema migration runs two separate
+│                  execute() calls — SQLx SQLite does not support multiple
+│                  statements in one call. No compile-time query macros —
+│                  uses runtime queries + manual row mapping to avoid
+│                  requiring DATABASE_URL at cargo build time.
+│
+├── models.rs      Plain Rust structs with Serde derives.
+│                  Video         — database row shape
+│                  VideoResponse — API response (adds stream_url, share_url)
+│                  UploadResponse — returned immediately after upload
+│
+├── error.rs       AppError enum. Variants map to HTTP status codes via
+│                  IntoResponse. All handler return types use this error.
+│
+├── streaming.rs   Single function: transcode_to_hls(). Shells out to ffmpeg.
+│                  Returns Ok(()) even on failure — system degrades gracefully
+│                  to byte-range streaming if FFmpeg is absent or crashes.
+│
+└── handlers/
+    ├── upload.rs  upload_video() — streams multipart to disk in chunks.
+    │              list_videos()  — returns all videos ordered by created_at.
+    │
+    ├── stream.rs  video_info()   — metadata lookup by token.
+    │              stream_video() — HTTP Range streaming with seek support.
+    │              hls_playlist() — serves m3u8 or 307s to raw stream.
+    │              hls_segment()  — serves individual .ts segment files.
+    │
+    └── health.rs  health_check() — returns {"status":"ok"}.
+```
+
+---
+
+## 3. Data Model
+
+### Schema
+
+```sql
+CREATE TABLE videos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    token         TEXT NOT NULL UNIQUE,      -- 8-char share token e.g. "a3f7bc12"
+    filename      TEXT NOT NULL,             -- stored name on disk: "{uuid}.{ext}"
+    original_name TEXT NOT NULL,             -- user's original filename for display
+    content_type  TEXT NOT NULL,             -- MIME type validated on upload
+    size_bytes    INTEGER NOT NULL,          -- total file size in bytes
+    duration_secs REAL,                      -- NULL — not yet populated
+    width         INTEGER,                   -- NULL — not yet populated
+    height        INTEGER,                   -- NULL — not yet populated
+    hls_ready     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_videos_token ON videos(token);
+```
+
+### Why `filename` and `original_name` Are Separate
+
+`filename` is the UUID-based name used on disk (`3f8a2c1d-...mp4`). It is server-generated to prevent collisions and path traversal. `original_name` is preserved for display. These must never be swapped — never use `original_name` to construct a file path.
+
+### Why `duration_secs`, `width`, `height` Are Nullable
+
+These require an FFprobe call, which adds latency to the upload response. They exist in the schema for future use — once HLS transcoding completes, a follow-up probe could populate them. Currently always `NULL`.
+
+### File Layout on Disk
+
+```
+/data/uploads/
+├── 3f8a2c1d-4b5e-6789-abcd-ef0123456789.mp4   ← raw upload (UUID filename)
+├── 9a1b2c3d-5e6f-7890-bcde-f01234567890.webm
+└── hls/
+    └── a3f7bc12/                               ← token as directory name
         ├── playlist.m3u8
         ├── seg000.ts
         ├── seg001.ts
-        └── seg002.ts ...
-
-Axum: UPDATE videos SET hls_ready = TRUE WHERE token = ?
-
-Browser: GET /api/hls/:token/playlist.m3u8
-  └→  #EXTM3U
-      #EXT-X-TARGETDURATION:2
-      seg000.ts
-      seg001.ts ...
+        └── seg002.ts
 ```
 
 ---
 
-### 2.3 Data Flow — All Endpoints
+## 4. Request Flows
 
-| Endpoint | Input | Output & Notes |
-|---|---|---|
-| `POST /api/upload` | multipart/form-data, `video` field | JSON: token, share_url, stream_url. File written to `/data/uploads/` |
-| `GET /api/stream/:token` | `Range: bytes=N-M` header | 206 Partial Content, video bytes. Full seek support. |
-| `GET /api/videos` | — | JSON array of all video metadata |
-| `GET /api/videos/:token` | token path param | JSON: single video metadata + stream URLs |
-| `GET /api/hls/:token/playlist.m3u8` | token | m3u8 playlist. 307 redirect to `/stream/` if HLS not ready yet. |
-| `GET /api/hls/:token/:segment` | token + segment name | MPEG-TS segment bytes. `Cache-Control: public, max-age=86400` |
-| `GET /health` | — | `{"status":"ok"}` — used by Docker healthcheck |
+### 4.1 Upload
+
+```
+Browser
+  │  POST /api/upload
+  │  Content-Type: multipart/form-data; boundary=...
+  │  Content-Length: 524288000
+  ▼
+nginx  [proxy_request_buffering off]
+  │  Bytes pass through immediately without nginx accumulating the body
+  ▼
+Axum  [DefaultBodyLimit::disable() on this route only]
+  │
+  │  Multipart field "video":
+  │    validate MIME type against allowlist
+  │    generate: uuid filename + 8-char token
+  │    File::create(upload_dir / uuid_filename)
+  │
+  │    loop chunks (~64KB each):
+  │      total_bytes += chunk.len()
+  │      if total_bytes > 1_073_741_824 → delete file, return 413
+  │      file.write_all(&chunk).await
+  │    file.flush().await
+  │
+  ├──→ INSERT INTO videos (token, filename, original_name, ...) VALUES (...)
+  │
+  ├──→ HTTP 200 { token, share_url, stream_url, size_bytes }
+  │    ↑ Response sent. Video is streamable at this exact moment.
+  │
+  └──→ tokio::spawn(transcode_to_hls(state, token, file_path))
+         Runs concurrently. On completion:
+         UPDATE videos SET hls_ready = TRUE WHERE token = ?
+```
+
+**Memory profile:** One chunk held in memory at a time (~64KB). A 1GB upload and a 1MB upload use identical peak RAM.
 
 ---
 
-## 3. Core Design Decisions & Rationale
+### 4.2 Streaming (HTTP Range)
 
-### 3.1 HTTP Range Streaming Before HLS
+```
+Browser <video src="/api/stream/a3f7bc12">
+  │  GET /api/stream/a3f7bc12
+  │  Range: bytes=0-1048575
+  ▼
+nginx  [proxy_buffering off]
+  │  Bytes stream through — nginx does not buffer the video response
+  ▼
+Axum
+  │  SELECT filename, content_type FROM videos WHERE token = 'a3f7bc12'
+  │  fs::metadata(file_path) → file_size = 524288000
+  │  parse Range: start=0, end=1048575, chunk=1048576
+  │  File::open(file_path)
+  │  [start > 0] file.seek(SeekFrom::Start(start))
+  │  ReaderStream::new(file.take(chunk_size))
+  │
+  └──→ HTTP 206 Partial Content
+       Content-Type: video/mp4
+       Content-Range: bytes 0-1048575/524288000
+       Accept-Ranges: bytes
+       Content-Length: 1048576
+       Cache-Control: public, max-age=3600
 
-**Decision:** Serve the raw uploaded file immediately via HTTP Range requests. Treat HLS as an async enhancement, not a prerequisite.
+-- User seeks to 02:30 --
 
-**Why:** The primary requirement is time-to-stream. Transcoding — even a fast remux — takes time. HTTP Range requests are natively supported by every browser's `<video>` element since HTML5. The video is playable the instant the upload write flushes. Zero additional processing required.
+  GET /api/stream/a3f7bc12
+  Range: bytes=37748736-38797311
 
-**Trade-off:** Seeking to an unloaded position in a large file causes a new network request. With HLS, seeking is instant because segments are pre-chunked. This is acceptable for the demo tier because most private videos are watched linearly.
-
-**Alternative considered:** Transcode first, stream after (YouTube's approach). Rejected because it adds mandatory latency before the video is watchable — the exact opposite of the primary requirement.
+  Axum: seek to 37,748,736 → stream 1,048,576 bytes
+  O(1) seek — no re-download from start
+```
 
 ---
 
-### 3.2 DefaultBodyLimit::disable() on Upload Route
+### 4.3 HLS Fallback
 
-**Decision:** Explicitly disable Axum's default body size limit on the `/api/upload` route only.
+```
+GET /api/hls/a3f7bc12/playlist.m3u8
 
-**Why:** Axum defaults to a **2MB body limit** for all routes. Any video larger than 2MB fails with a multipart parse error before the handler even runs. The limit is disabled at the route level so all other routes retain the 2MB default as a security measure. The handler enforces the 1GB limit itself by tracking `total_bytes` during streaming.
+  SELECT hls_ready FROM videos WHERE token = 'a3f7bc12'
 
+  hls_ready = FALSE:
+    HTTP 307 Temporary Redirect
+    Location: /api/stream/a3f7bc12
+    Browser transparently plays via byte-range instead
+
+  hls_ready = TRUE:
+    read /data/uploads/hls/a3f7bc12/playlist.m3u8
+    HTTP 200
+    Content-Type: application/vnd.apple.mpegurl
+    Cache-Control: no-cache   ← playlist must never be cached
+```
+
+---
+
+## 5. Design Decisions
+
+Each entry: **what was chosen**, **why**, **what was explicitly rejected**.
+
+---
+
+### 5.1 Serve raw file immediately; transcode async
+
+**Chosen:** File is streamable the moment the upload write flushes. HLS runs in `tokio::spawn` after the response is sent.
+
+**Why:** Time-to-stream is the first priority. Any mandatory processing step before the video is playable violates this directly.
+
+**Rejected:** *Transcode first, stream after.* Adds mandatory latency of seconds to minutes before the video is watchable. Wrong for this use case.
+
+**Rejected:** *Real-time HLS segmentation during upload* (pipe bytes into FFmpeg stdin). Eliminates transcoding delay. Rejected because it couples upload and transcode into a single fragile pipeline — a FFmpeg crash aborts the upload. The current decoupled approach is more resilient.
+
+---
+
+### 5.2 `DefaultBodyLimit::disable()` on upload route only
+
+**Chosen:** Per-route layer on `POST /api/upload` only.
+
+**Why:** Axum defaults to a 2MB body limit globally. Without disabling it, files larger than 2MB fail with a multipart parse error before the handler sees a single byte. Disabling globally would remove protection from all other routes. The 1GB limit is then enforced by the handler itself as it counts bytes.
+
+**Implementation:**
 ```rust
 .route("/api/upload", post(handlers::upload::upload_video)
     .layer(DefaultBodyLimit::disable()))
@@ -213,713 +326,389 @@ Browser: GET /api/hls/:token/playlist.m3u8
 
 ---
 
-### 3.3 FFmpeg `-c:v copy` (Remux, No Re-encode)
+### 5.3 FFmpeg subprocess, not Rust bindings
 
-**Decision:** Use FFmpeg with `-c:v copy` for HLS transcoding — remux without decoding/encoding the video stream.
+**Chosen:** `tokio::process::Command::new("ffmpeg")`.
 
-**Why:** Re-encoding is CPU-intensive and slow. A 1GB H.264 video re-encoded at 1080p takes 10-30 minutes on a shared-CPU instance. Remuxing the same file into HLS segments takes **seconds** — it's purely I/O bound. The video bitstream is copied as-is into MPEG-TS containers.
+**Why:** `ffmpeg-sys` Rust bindings add hours to build time and mean a codec bug can segfault the Axum process. A subprocess crash is isolated. `-c:v copy` makes the transcode I/O-bound, so subprocess overhead is negligible.
 
-**Trade-off:** If the source uses an exotic codec (AV1, VP9 in MKV), some browsers may not decode the HLS segments. For the target use case (MP4/H.264 — the dominant upload format), this is not an issue. The raw byte-range stream remains available as fallback.
+**Rejected:** *ffmpeg-sys bindings.* More integrated, but build complexity and crash isolation trade-off is wrong.
 
-**FFmpeg command used:**
-```bash
-ffmpeg -i input.mp4 \
-  -c:v copy \          # no re-encode — copies video bitstream as-is
-  -c:a aac \           # re-encode audio to AAC (universal HLS compatibility)
-  -hls_time 2 \        # 2-second segments
-  -hls_list_size 0 \   # keep all segments in playlist (VOD mode)
-  -hls_segment_type mpegts \
-  -hls_segment_filename seg%03d.ts \
-  -f hls playlist.m3u8
-```
+**Rejected:** *Cloud transcoding (MediaConvert, Cloudflare Stream).* External dependency, per-minute costs, network latency, incompatible with $0 goal.
 
 ---
 
-### 3.4 SQLite for Metadata
+### 5.4 Runtime SQLx queries, not compile-time macros
 
-**Decision:** Use SQLite as the metadata store, accessed via SQLx with runtime (non-macro) queries.
+**Chosen:** `sqlx::query("...").bind(x).fetch_*()` with manual `.get("column_name")` row mapping.
 
-**Why:** The metadata schema is trivial — one table, one index. SQLite in WAL mode handles concurrent reads without blocking writes. It requires zero external dependencies, making local development and free-tier deployment identical. The SQLx driver is database-agnostic — switching to PostgreSQL is a one-line change in `DATABASE_URL`.
+**Why:** `sqlx::query_as!()` and `sqlx::query!()` require `DATABASE_URL` set at `cargo build` time and a live database to validate SQL against. This always fails in Docker build containers. Runtime queries compile without a database.
 
-**Why runtime queries (not `query_as!` macros):** SQLx compile-time macros require a live database connection during `cargo build`. This fails inside Docker build containers where no database is running. Runtime queries with manual row mapping eliminate this constraint entirely.
-
-```rust
-// ❌ Compile-time macro — requires DATABASE_URL at build time
-let row = sqlx::query_as!(Video, "SELECT * FROM videos WHERE token = ?", token)
-
-// ✅ Runtime query — works anywhere
-let row = sqlx::query("SELECT * FROM videos WHERE token = ?")
-    .bind(token)
-    .fetch_optional(&pool)
-    .await?;
-```
+**Trade-off:** Compile-time SQL validation is lost. Column name typos become runtime panics. Acceptable for this schema size.
 
 ---
 
-### 3.5 Token-Based Sharing (No Auth)
+### 5.5 SQLite with `sqlite://path?mode=rwc`
 
-**Decision:** Generate an 8-character alphanumeric token as the sole sharing credential. No accounts, sessions, or JWTs.
+**Chosen:** Absolute path + `?mode=rwc` flag.
 
-**Why:** The requirement explicitly excludes authentication. 36^8 ≈ **2.8 trillion combinations** makes brute force infeasible for a private service. The token appears in the URL path (`/watch/:token`) making it naturally shareable.
+**Why:** Without `mode=rwc`, SQLite requires the file to already exist. On first container start, it doesn't — connection fails. `rwc` = read/write/create.
 
-**Security note:** This is security-by-obscurity, not access control. For production use requiring true privacy, layer time-limited signed URLs (e.g. CloudFront signed URLs) on top.
+Absolute path (`/app/streamvault.db`) instead of relative path: relative paths resolve against the process CWD, which can differ from the Dockerfile `WORKDIR` in some runtimes. Absolute path is unambiguous.
 
----
-
-### 3.6 Direct-to-Disk Upload Streaming
-
-**Decision:** Stream multipart chunks directly to disk without buffering in application memory.
-
-**Why:** A 1GB file cannot be held in RAM on small free-tier instances (256-512MB total RAM). Axum's Multipart API exposes an async stream interface. Writing chunks as they arrive keeps memory usage at **O(chunk_size) ≈ 64KB** regardless of file size.
-
-```rust
-while let Some(chunk) = field.chunk().await? {
-    total_bytes += chunk.len();
-    if total_bytes > MAX_UPLOAD_BYTES { /* reject */ }
-    file.write_all(&chunk).await?;  // directly to disk
-}
-```
+`/app/` specifically, not `/data/`: Docker volumes overwrite the entire mount point at container start. `/data/uploads` is a volume mount — any files created inside `/data/` during image build are gone at runtime. `/app/` is the `WORKDIR`, never a volume mount, always writable by the process.
 
 ---
 
-### 3.7 SQLite URL Format: `sqlite://path?mode=rwc`
+### 5.6 Single `index.html` frontend, no build step
 
-**Decision:** Use `?mode=rwc` in the SQLite connection URL.
+**Chosen:** Vanilla JS SPA in a single `index.html`. nginx serves it with `COPY index.html`.
 
-**Why:** Without `mode=rwc`, SQLite's default mode is read/write on an **existing file only**. If the file doesn't exist (first startup, fresh container), the connection fails with `unable to open database file`. The `rwc` flag means **r**ead/**w**rite/**c**reate — SQLite creates the file if it doesn't exist.
+**Why:** A framework frontend requires `npm install` during Docker build, which pulls packages from the internet. This introduced repeated failures during development (missing `app.html`, missing `svelte.config.js`, ESM-only errors, `"type":"module"` missing from package.json, etc.). A single HTML file has zero dependencies and builds in milliseconds.
 
-```
-sqlite:///app/streamvault.db?mode=rwc
-```
+**Trade-off:** No TypeScript, no component system, no hot module replacement in development. Acceptable for a UI this simple.
 
 ---
 
-## 4. Full Technology Stack
+### 5.7 Token generation
 
-### 4.1 Backend (Rust)
+**Chosen:** 8 chars from `[a-z0-9]` (36^8 ≈ 2.8 trillion combinations).
 
-| Library | Version | Purpose |
-|---|---|---|
-| **Rust** | 1.85+ | Language — memory-safe, zero-cost abstractions, no GC pauses |
-| **Axum** | 0.7 | Async HTTP framework built on hyper/tokio. Extractors, routing, middleware |
-| **Tokio** | 1.x | Async runtime — multi-threaded work-stealing scheduler, `spawn()` for background tasks |
-| **SQLx** | 0.7 | Async SQL toolkit — SQLite driver, runtime queries, connection pooling |
-| **Tower-HTTP** | 0.5 | CORS middleware, request tracing via `TraceLayer` |
-| **tokio-util** | 0.7 | `ReaderStream` — streams file bytes as HTTP response body |
-| **UUID** | 1.x | Generating unique filenames for uploaded video files |
-| **Serde / serde_json** | 1.x | JSON serialization for all API responses |
-| **anyhow** | 1.x | Ergonomic error handling with context chaining |
-| **futures** | 0.3 | `StreamExt` trait for async iteration over multipart chunks |
-| **rand** | 0.8 | Generating 8-character alphanumeric share tokens |
-| **tracing / tracing-subscriber** | 0.1 / 0.3 | Structured logging with env-filter for log level control |
-| **FFmpeg** | System binary | HLS remux via subprocess — not a Rust dependency |
+**Rejected:** *UUID v4.* More entropy than needed, longer URLs, harder to share verbally.
 
-### 4.2 Frontend
+**Rejected:** *Sequential integer IDs.* Enumerable — any user could walk the ID space and discover all videos.
 
-| Technology | Purpose |
-|---|---|
-| **Vanilla JavaScript** | SPA routing via History API `pushState`, upload logic, video player |
-| **XMLHttpRequest** | Upload with real progress events (`fetch()` API does not expose upload progress) |
-| **HTML5 `<video>`** | Native video playback — byte-range seeking built in to all modern browsers |
-| **CSS Custom Properties** | Design token system for consistent dark UI theming |
-| **Google Fonts** | Space Grotesk (UI sans-serif) + IBM Plex Mono (code/metadata display) |
-| **nginx alpine** | Serves `index.html`, proxies `/api/*` to backend, streaming-optimised config |
-
-### 4.3 Infrastructure
-
-| Tool | Purpose |
-|---|---|
-| **Docker** | Containerises both services — `rust:latest` builder + runtime image |
-| **Docker Compose** | Orchestrates backend + frontend, manages named volume for video data |
-| **Docker named volume** | Persists uploaded files and HLS segments across container restarts |
-| **nginx** | `client_max_body_size 1100M`, `proxy_buffering off`, `proxy_request_buffering off` |
-
-### 4.4 Key nginx Configuration Explained
-
-```nginx
-location /api/ {
-    proxy_pass http://backend:3000;
-    proxy_buffering off;              # stream response bytes to client immediately
-    proxy_request_buffering off;      # stream request body to backend immediately
-    client_max_body_size 1100M;       # allow up to 1.1GB uploads
-    proxy_read_timeout 3600s;         # 1-hour timeout for large uploads
-    proxy_send_timeout 3600s;
-}
-```
-
-`proxy_buffering off` is critical — without it nginx would buffer the entire video file in memory before sending it to the browser, destroying the streaming behaviour.
+At 1,000 requests/second with 10,000 videos in the system, the probability of a collision per request is ~3.5 × 10⁻⁹. Not worth a uniqueness pre-check.
 
 ---
 
-## 5. Alternative Approaches & Trade-offs
+## 6. Technology Choices & Alternatives
 
-### 5.1 Alternative Languages / Frameworks
+### Runtime
 
-| Runtime | Throughput | Memory | Dev Speed | Verdict |
+| | Rust / Axum | Go / Fiber | Node.js / Fastify | Python / FastAPI |
 |---|---|---|---|---|
-| **Rust / Axum** *(current)* | Best — zero-copy I/O, no GC | ~5MB idle | Slowest — strict compiler | ✅ Correct choice for I/O-heavy streaming |
-| Go / Fiber | Excellent — goroutines | ~20MB idle | Fast | Good alternative, simpler concurrency model |
-| Node.js / Fastify | Good — event loop | ~60MB idle | Fastest | Acceptable but GC pauses visible under load |
-| Python / FastAPI | Poor — GIL limits threads | ~80MB idle | Fast | Wrong tool for high-concurrency streaming |
-| Elixir / Phoenix | Excellent — BEAM | ~30MB idle | Medium | Great concurrency model, niche skillset |
+| Memory idle | ~5 MB | ~15 MB | ~50 MB | ~70 MB |
+| GC pauses during streaming | None | Occasional | Occasional | Occasional |
+| Throughput | Highest | High | Good | Adequate |
+| Docker image size | Large (rust:latest) | Small (scratch) | Medium | Medium |
+| First build time | 3-5 min | 30 sec | 10 sec | 5 sec |
 
-Rust is correct here because the bottleneck is I/O, not business logic. ~5MB idle RAM means it runs on the smallest free-tier instances.
+Rust's advantage is memory efficiency and no GC pauses. At 500 concurrent viewers, Rust uses ~50 MB RAM. The equivalent Node.js deployment: ~300 MB. The large image size is a known trade-off — resolvable with `musl` + scratch base in production.
 
----
+### Storage
 
-### 5.2 Alternative Storage Backends
-
-| Storage | Pros | Cons |
-|---|---|---|
-| **Local disk** *(current)* | Zero setup, no cost, lowest latency | Tied to one VM, no redundancy, blocks horizontal scaling |
-| Cloudflare R2 | Zero egress cost, S3-compatible, global CDN | $0.015/GB storage, SDK integration needed |
-| AWS S3 | Most mature, 11-nine durability, presigned URLs | $0.023/GB storage + $0.09/GB egress — expensive for video |
-| Backblaze B2 | $0.006/GB storage, free egress via Cloudflare | Less ecosystem tooling than S3 |
-| MinIO (self-hosted) | S3-compatible, fully self-hosted, free | Full ops burden, no managed redundancy |
-
-**Recommendation for production:** Cloudflare R2. Zero egress cost fundamentally changes the economics of video hosting — 1TB served costs $0 in egress vs ~$92 on S3.
-
----
-
-### 5.3 Alternative Streaming Protocols
-
-| Protocol | Strengths | Weaknesses |
-|---|---|---|
-| **HTTP Range** *(current)* | Instant availability, zero processing, universal browser support | No adaptive bitrate, seek overhead on large files |
-| **HLS** *(async, current)* | Adaptive bitrate possible, CDN-cacheable segments, native iOS/Safari | Requires FFmpeg, 2-10s delay before available |
-| MPEG-DASH | Open standard, finer ABR control, HDR support | Poor Safari support, complex manifests |
-| WebRTC | Ultra-low latency (<500ms), peer-to-peer capable | Not designed for VOD, signaling server required |
-| Progressive Download | Simple — just serve the file | No seeking, no ABR, wastes bandwidth on partial views |
-
-StreamVault uses **both** Range and HLS — Range for immediate availability, HLS for enhanced playback once transcoding completes.
-
----
-
-### 5.4 Alternative Database Options
-
-| Database | Best For | Avoid When |
-|---|---|---|
-| **SQLite** *(current)* | Single-node, simple schema, free tier, <1000 writes/sec | Multi-writer distributed setup |
-| PostgreSQL | Multi-node, complex queries, full ACID | Overkill for simple metadata, $15+/mo managed |
-| Turso (libSQL) | Edge SQLite with replication, low global latency | Large datasets, complex joins |
-| DynamoDB | Hyper-scale writes, serverless billing | Complex queries, high cost at low scale |
-| PlanetScale | MySQL-compatible, schema branching | Adds migration workflow complexity |
-
----
-
-### 5.5 HLS Segment Duration Trade-offs
-
-The current setting is `hls_time 2` (2-second segments). This is a deliberate balance:
-
-| Segment Duration | Seek Latency | HTTP Requests | Buffer Depth |
+| | Local disk (current) | Cloudflare R2 | AWS S3 |
 |---|---|---|---|
-| 1 second | Fastest | Very high | 3 requests = 3s |
-| **2 seconds** *(current)* | Fast | Moderate | 3 requests = 6s |
-| 4 seconds | Moderate | Low | 3 requests = 12s |
-| 10 seconds | Slow | Very low | 3 requests = 30s |
+| Setup | Zero | SDK + credentials | SDK + IAM + credentials |
+| Cost (storage) | $0 | $0.015/GB | $0.023/GB |
+| Egress cost | $0 (local) | $0 | $0.09/GB |
+| Horizontal scaling | Blocked | Unlimited | Unlimited |
+| Durability | Single disk | 11 nines | 11 nines |
 
-2 seconds is the HLS default and the right choice for VOD content with interactive seeking.
+The code separates "storage location" from "file path" cleanly. Migrating to R2 means replacing the file read/write calls in the handlers — the router, models, and database are unchanged.
 
----
+### Database
 
-## 6. Deployment Architectures
+| | SQLite (current) | PostgreSQL | Turso |
+|---|---|---|---|
+| Setup | Zero | Managed instance | Sign up + connection string |
+| Cost | $0 | $15-70/mo managed | $0 free tier |
+| Concurrent writes | Single writer | Multiple | Multiple (replicated SQLite) |
+| Migration | — | Change DATABASE_URL | Change DATABASE_URL |
 
-### 6.1 Current: Local Docker Compose
+SQLx abstracts the driver — the query syntax for SQLite and PostgreSQL is identical in this codebase. The migration path is one environment variable.
 
-```
-Host Machine
-├── docker compose up --build
-├── streamvault-frontend (nginx:alpine, port 80)
-│   └── serves index.html + proxies /api/*
-└── streamvault-backend (rust:latest)
-    ├── /app/streamvault.db  (SQLite, in-container)
-    └── /data/uploads/       (Docker volume: video_data)
-```
+### Streaming Protocol
 
-| Property | Value |
-|---|---|
-| Startup | `docker compose up --build` |
-| Stop + wipe | `docker compose down -v` |
-| DB location | `/app/streamvault.db` inside backend container |
-| Video storage | Docker named volume `video_data` → `/data/uploads` |
-| Cost | $0 — runs on any machine with Docker |
+| | HTTP Range (current) | HLS async (current) | DASH |
+|---|---|---|---|
+| Time-to-stream | Zero (instant) | Seconds | Seconds |
+| Adaptive bitrate | No | Yes (with ABR encode) | Yes |
+| Seek performance | Network round-trip | Instant within buffered segments | Instant |
+| Browser support | All | All + native Safari | All except Safari |
+| CDN cacheability | Partial | Full (immutable segments) | Full |
 
----
-
-### 6.2 Free Tier Cloud Deployment ($0/month)
-
-```
-Internet
-    │
-    ▼ HTTPS
-Cloudflare (free)
-    │ DNS + DDoS + SSL
-    ├──────────────────────────────────────────────┐
-    │ /                                            │ /api/*
-    ▼                                              ▼
-Cloudflare Pages (free)              Fly.io App (free tier)
-index.html SPA                       Rust/Axum binary
-                                          │
-                                     ┌────▼────┐  ┌──────────┐
-                                     │ SQLite  │  │  Tigris  │
-                                     │ Fly vol │  │  5GB free│
-                                     └─────────┘  └──────────┘
-```
-
-| Layer | Service | Free Allowance |
-|---|---|---|
-| Compute (API) | Fly.io | 3x shared-CPU-1x 256MB VMs, always-on |
-| Object Storage | Tigris (Fly.io native) | 5GB storage, S3-compatible |
-| Database | SQLite on Fly volume | 1GB persistent volume |
-| Frontend CDN | Cloudflare Pages | Unlimited bandwidth, global edge |
-| TLS & DNS | Cloudflare | Free SSL, DDoS protection, analytics |
-| Total | | **$0/month** |
-
-> ⚠️ **Limitation at this tier:** Axum proxies video bytes through the Fly.io instance. Fly charges ~$0.02/GB egress beyond the free allowance. For frequently-watched videos, implement presigned S3 URLs to redirect the browser directly to Tigris.
+StreamVault uses both: Range for immediacy, HLS for quality. The player checks `hls_ready` and picks the right URL automatically.
 
 ---
 
-### 6.3 Production Deployment ($20-50/month)
+## 7. Deployment Tiers
 
-Targets: 100-500 concurrent viewers, up to 1TB storage, global audience.
+### Tier 0 — Local / Demo ($0)
 
-```
-Internet
-    │
-    ▼ HTTPS
-Cloudflare (free plan)
-    │
-    ├── Static SPA → Cloudflare Pages (free)
-    │
-    └── /api/* → Fly.io Load Balancer
-                      │
-              ┌───────┴────────┐
-              ▼                ▼
-         Axum Node 1      Axum Node 2
-              │                │
-              └───────┬────────┘
-                      │
-         ┌────────────┴────────────┐
-         ▼                         ▼
-    Turso (libSQL)           Cloudflare R2
-    Edge database            Zero-egress storage
-    (replicated globally)    + CDN delivery
+```bash
+docker compose up --build
 ```
 
-| Layer | Service | Monthly Cost |
-|---|---|---|
-| Compute | Fly.io 2x shared-4-CPU 2GB RAM | ~$14 |
-| Object Storage | Cloudflare R2 (500GB) | ~$7.50 |
-| Database | Turso free tier | $0 |
-| CDN | Cloudflare free plan | $0 |
-| Total | | **~$22-50/month** |
+SQLite in the container. Videos on a Docker named volume. Not suitable for production. Good for development and demos.
 
 ---
 
-### 6.4 $1,000/Month Production Stack
+### Tier 1 — Free Cloud ($0/month)
 
-Targets: 1,000-10,000 concurrent viewers, multi-region, full observability, dedicated transcode workers.
+- **Fly.io** — backend container (3 shared VMs, always-on, free)
+- **Tigris** (Fly.io native) — object storage replacing local disk (5GB free, S3-compatible)
+- **Cloudflare Pages** — SPA frontend (unlimited bandwidth, free)
+- **Cloudflare** — DNS + SSL (free)
 
-```
-Internet
-    │
-Cloudflare Pro ($20/mo) — WAF, DDoS, Bot Protection
-    │
-    ├── Cloudflare Pages — SPA frontend (free)
-    │
-    └── Cloudflare Load Balancing
-              │
-    ┌─────────┼─────────┐
-    ▼         ▼         ▼
- API (iad) API (lhr) API (nrt)     ← 3 regions on Fly.io
-    │         │         │
-    └────┬────┴────┬────┘
-         │         │
-    Neon Postgres  Cloudflare R2
-    ($69/mo)       ($150/mo, 10TB)
-    Serverless,    Zero egress,
-    autoscaling    global CDN
+**Code changes needed:**
+1. Add `aws-sdk-s3` crate; replace `File::create` in upload with S3 PUT
+2. Replace file reads in stream handler with S3 GET
+3. SQLite remains on Fly volume
 
-    Separate transcode workers (4x) ← pull from Redis job queue
-    Upstash Redis ($30/mo) ← job queue + retry logic
-
-    Datadog / Grafana ($100/mo) ← metrics, dashboards
-    Sentry ($26/mo) ← error tracking
-```
-
-| Item | Monthly Cost |
-|---|---|
-| Fly.io — 4x API nodes (3 regions) | ~$200 |
-| Fly.io — 4x transcode workers | ~$120 |
-| Cloudflare R2 (10TB storage) | ~$150 |
-| Neon PostgreSQL (serverless) | ~$69 |
-| Upstash Redis (job queue) | ~$30 |
-| Cloudflare Pro (WAF + DDoS) | ~$20 |
-| Sentry Team (error tracking) | ~$26 |
-| Grafana Cloud (metrics) | ~$100 |
-| GitHub Actions CI/CD | ~$16 |
-| Misc (staging, backups, DNS) | ~$50 |
-| **Total** | **~$781/month** |
-
-$219/month headroom remains for spikes, new regions, or additional storage.
+**Limitation:** Fly.io charges ~$0.02/GB egress beyond free allowance. Axum proxies all video bytes at this tier.
 
 ---
 
-## 7. Horizontal Scaling Strategies
+### Tier 2 — Small Production ($20-50/month)
 
-### 7.1 Making the API Stateless
+**Architecture change:** presigned URLs for video delivery.
 
-The Axum service is already stateless by design. All persistent state lives in the database and object storage. To run multiple nodes:
+```
+Before:  Browser → Axum → S3 → Axum → Browser   (Axum in data path)
 
-- **Replace SQLite → PostgreSQL or Turso** — both support concurrent connections from multiple nodes
-- **Replace local disk → S3/R2** — all nodes read/write from the same object store
-- **Add a load balancer** — Fly.io built-in proxy, Cloudflare Load Balancing, or AWS ALB
+After:   Browser → GET /api/videos/:token
+                   Axum generates presigned_url (15-min TTL)
+         Browser → <video src=presigned_url> → R2 → CDN → Browser
+                   (Axum handles zero video bytes at playback time)
+```
 
-No session state, no shared memory, no file locks between nodes. The only coordination is through the database.
+**Cost:** ~$14/mo compute (Fly.io) + ~$7.50/mo storage (R2 500GB) = ~$22-50/mo total.
 
 ---
 
-### 7.2 Direct-to-S3 Upload (Bypass the API for Uploads)
+### Tier 3 — Production at Scale ($100-300/month)
 
-At high upload volume, every byte flows through the API node. The solution is **presigned PUT URLs**:
-
-```
-1. Browser → POST /api/upload/init
-              Axum generates presigned S3 PUT URL + pending token
-              Returns { uploadUrl, token }
-
-2. Browser → PUT {uploadUrl}  (direct to S3/R2, bypassing Axum entirely)
-              Upload throughput = S3 throughput (effectively unlimited)
-
-3. Browser → POST /api/upload/complete?token=...
-              Axum marks video as active, spawns HLS transcode
-              Returns { share_url, stream_url }
-```
-
-Result: unlimited upload throughput, zero API node bandwidth consumed for uploads.
+Changes from Tier 2:
+- SQLite → PostgreSQL (Neon serverless, ~$69/mo)
+- `tokio::spawn` transcode → Redis job queue + dedicated worker fleet
+- 3+ API nodes behind Fly.io load balancer
+- Cloudflare Pro for WAF and edge rate limiting
 
 ---
 
-### 7.3 Presigned Download URLs (Bypass the API for Streaming)
+## 8. Scaling
 
-Currently every video byte flows through Axum during playback. At 500 concurrent viewers at 5Mbps, that's 2.5Gbps through the API nodes.
+### What Blocks Horizontal Scaling Today
+
+1. **Local disk** — uploaded videos on a single Docker volume. A second API node cannot read files written by the first.
+2. **SQLite single-writer** — WAL mode allows concurrent reads but only one writer. Above ~100 concurrent uploads, write contention appears.
+
+Both are environment variable changes, not code rewrites.
+
+### Upload Scaling: Presigned S3 PUTs
 
 ```
-Before (current):
-Browser → Axum → reads file → streams bytes to browser
+Step 1: Browser → POST /api/upload/init
+          Axum: generate token, insert pending row
+          Return: { presigned_put_url, token }
 
-After (presigned URLs):
-Browser → GET /api/videos/:token
-          Axum generates presigned R2 GET URL (15-min TTL)
-          Returns { ..., presigned_url }
-Browser → <video src="{presigned_url}">
-          Video bytes flow: R2 → Cloudflare CDN → Browser
-          Axum handles zero video bytes at playback time
+Step 2: Browser → PUT {presigned_put_url}  (direct to S3/R2)
+          Axum handles zero upload bytes
+
+Step 3: Browser → POST /api/upload/complete?token={token}
+          Axum: mark active, spawn transcode job
 ```
 
----
+Upload throughput limited by S3 capacity, not API node count.
 
-### 7.4 Transcode Worker Pool
-
-At high upload volume, background `tokio::spawn` tasks saturate the API node's CPU. The scale-out path:
+### Transcode Scaling: Worker Pool
 
 ```
 Current:
-  Upload → tokio::spawn(ffmpeg) on API node
+  upload_handler → tokio::spawn(ffmpeg) on API process
 
 Scaled:
-  Upload → push job to Redis queue
-  
-  Worker nodes (separate fleet):
+  upload_handler → redis.rpush("transcode_queue", {token, path})
+
+  Worker process (separate fleet):
     loop {
-      job = redis.pop("transcode_queue")
-      run_ffmpeg(job.input_path)
-      upload_segments_to_r2(job.token)
-      db.mark_hls_ready(job.token)
+        job = redis.blpop("transcode_queue")
+        run_ffmpeg(job) → write segments to R2
+        db.mark_hls_ready(job.token)
     }
 ```
 
-Workers scale independently from API nodes — add workers when transcode queue depth grows.
+Workers are CPU-heavy (ABR encode). API nodes are I/O-light (metadata + URL generation). Decoupling allows right-sizing each fleet independently.
+
+### HLS Segment Caching
+
+Segments are immutable once written — ideal CDN cache objects:
+
+- `Cache-Control: public, max-age=86400` — already set in current code
+- First request hits origin; every subsequent is served from CDN edge
+- `.m3u8` playlist: `Cache-Control: no-cache` — must never be stale
 
 ---
 
-### 7.5 CDN Caching for HLS Segments
+## 9. The $1,000/Month Stack
 
-HLS segments are immutable once written — perfect CDN cache targets:
+Handles 5,000-10,000 concurrent viewers, multi-region, full observability.
 
-- `Cache-Control: public, max-age=86400` on segment responses (already set in code)
-- `Cache-Control: no-cache` on `.m3u8` playlist (must not be cached — already set)
-- With Cloudflare R2 + CDN, segments are served from the nearest edge — zero origin load after first request
+### Infrastructure
+
+| Component | Service | Monthly Cost |
+|---|---|---|
+| API nodes (3 regions: iad, lhr, nrt) | Fly.io 4x dedicated-CPU-2x 4GB | ~$200 |
+| Transcode workers | Fly.io 4x shared-CPU-4x 8GB | ~$120 |
+| Video storage | Cloudflare R2 (10TB, zero egress) | ~$150 |
+| Database | Neon PostgreSQL (serverless) | ~$69 |
+| Job queue | Upstash Redis | ~$30 |
+| CDN + WAF | Cloudflare Pro | ~$20 |
+| Error tracking | Sentry Team | ~$26 |
+| Metrics + dashboards | Grafana Cloud | ~$100 |
+| CI/CD | GitHub Actions | ~$16 |
+| Misc (staging, backups) | — | ~$50 |
+| **Total** | | **~$781/mo** |
+
+$219/mo headroom for spikes, new regions, or additional storage.
+
+### Code Changes Required
+
+| Change | Effort | Impact |
+|---|---|---|
+| S3/R2 storage client | Medium | Enables horizontal scaling |
+| Presigned download URLs | Small (10 lines) | Removes Axum from video data path |
+| PostgreSQL (change DATABASE_URL) | Trivial | Multi-writer, durability |
+| Redis job queue + worker binary | Medium | Independent transcode scaling |
+| ABR HLS (720p + 480p encode pass) | Small | Adaptive bitrate on slow connections |
+| Video thumbnails | Small | Better UI in video grid |
+| Video duration (FFprobe) | Small | Populated `duration_secs` in API |
+
+### What Does Not Change
+
+The Axum router, all handler logic, database schema, token system, HTTP Range implementation, and nginx config are **unchanged** across all deployment tiers. The application does not know what infrastructure tier it runs on.
 
 ---
 
-### 7.6 Scaling Decision Tree
+## 10. Security
 
-```
-Current load → Action needed
+### Current Protections
 
-< 50 viewers     → Docker Compose on local machine ($0)
-50-500 viewers   → Fly.io + R2 + Turso ($20-50/mo)
-500-2000 viewers → Presigned URLs + 2 API nodes + Postgres ($80-150/mo)
-2000-10000       → Worker pool + job queue + 4+ nodes + multi-region ($400-600/mo)
-10000+           → Kubernetes + global CDN + dedicated transcode fleet ($1000+/mo)
-```
+| Vector | Mitigation | Sufficient for production? |
+|---|---|---|
+| Path traversal via HLS segment names | Reject requests containing `/` or `..` | Yes |
+| Oversized uploads | 1GB check in handler + nginx `client_max_body_size 1100M` | Yes |
+| Body stuffing on metadata routes | Axum default 2MB limit on all non-upload routes | Yes |
+| MIME type spoofing | Allowlist validation + extension inference | Yes |
+| Token enumeration | 2.8 trillion combinations | Personal use — rate limiting needed for public |
+| CORS | Currently `Any` (all origins) | No — must restrict to your domain |
+| Malicious file content | None | No — virus scanning needed |
 
----
+### Hardening for Public Deployment
 
-## 8. Optimization Roadmap with $1,000/Month Budget
-
-### Priority 1 — Object Storage + CDN (~$150/mo, highest ROI)
-
-Migrate from local disk to Cloudflare R2 with presigned URLs.
-
-**Impact:** Horizontal scaling unblocked, zero egress cost, global low-latency delivery, 11-nine durability.
-
-**Code changes needed:**
+**Rate limiting** (add `tower-governor` crate):
 ```rust
-// Add to Cargo.toml
-aws-sdk-s3 = "1"  // R2 is S3-compatible
-
-// Upload: write to R2 instead of local disk
-let upload = s3_client.put_object()
-    .bucket(&bucket)
-    .key(&key)
-    .body(ByteStream::from(file_bytes))
-    .send().await?;
-
-// Stream: generate presigned URL instead of proxying bytes
-let presigned = s3_client.get_object()
-    .bucket(&bucket)
-    .key(&key)
-    .presigned(PresigningConfig::expires_in(Duration::from_secs(900))?)
-    .await?;
+.route("/api/upload", post(upload_video)
+    .layer(DefaultBodyLimit::disable())
+    .layer(GovernorLayer {
+        config: Arc::new(GovernorConfig::default()
+            .per_millisecond(100)
+            .burst_size(5))
+    }))
 ```
 
----
-
-### Priority 2 — Adaptive Bitrate HLS ($0 extra, software change)
-
-Add multi-rendition HLS output to the transcode pipeline:
-
-```bash
-# Current: single quality
-ffmpeg -i input.mp4 -c:v copy -hls_time 2 -f hls playlist.m3u8
-
-# With ABR: three quality levels
-ffmpeg -i input.mp4 \
-  -map 0:v -map 0:a -c:v copy -c:a aac \
-    -hls_time 2 -hls_segment_filename "1080p_%03d.ts" -f hls 1080p.m3u8 \
-  -map 0:v -map 0:a -vf scale=-2:720 -b:v 2500k -c:a aac \
-    -hls_time 2 -hls_segment_filename "720p_%03d.ts" -f hls 720p.m3u8 \
-  -map 0:v -map 0:a -vf scale=-2:480 -b:v 1000k -c:a aac \
-    -hls_time 2 -hls_segment_filename "480p_%03d.ts" -f hls 480p.m3u8
-
-# Master playlist (written by code)
-#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
-1080p.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
-720p.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480
-480p.m3u8
+**CORS** (restrict to your domain):
+```rust
+CorsLayer::new()
+    .allow_origin("https://stream.yourdomain.com"
+        .parse::<HeaderValue>().unwrap())
 ```
 
-Players automatically switch renditions based on network conditions.
-
----
-
-### Priority 3 — PostgreSQL ($69/mo)
-
-```bash
-# One environment variable change
-DATABASE_URL=postgres://user:pass@neon.tech/streamvault
+**Virus scanning** (ClamAV after upload, before database insert):
+```rust
+let result = Command::new("clamdscan").arg(&file_path).status().await?;
+if !result.success() {
+    tokio::fs::remove_file(&file_path).await?;
+    return Err(AppError::BadRequest("File rejected".into()));
+}
 ```
 
-SQLx's query API is identical for SQLite and PostgreSQL — no code changes beyond the URL. Benefits: multi-node writes, connection pooling, point-in-time recovery, full-text search.
+**Token expiry** — add `expires_at DATETIME` column to schema. Check on every stream/metadata request.
+
+**Signed URLs** — for true access control (current tokens are obscurity, not auth), generate HMAC-signed time-limited URLs and verify the signature on each streaming request.
 
 ---
 
-### Priority 4 — Transcode Worker Separation ($150/mo)
+## 11. Observability
 
-Extract `tokio::spawn(ffmpeg)` into a separate worker service with a Redis job queue. API nodes drop to minimal CPU — they only handle metadata and URL generation.
+### Current State
 
----
+Structured logging via the `tracing` crate:
 
-### Priority 5 — Observability ($126/mo)
-
-- **Sentry** ($26/mo) — full stack traces, performance monitoring, release tracking
-- **Grafana Cloud** ($100/mo) — upload success rate, stream latency p50/p95/p99, transcode queue depth, storage usage trends
-
----
-
-### Priority 6 — Video Thumbnails ($0, software change)
-
-```bash
-# Extract thumbnail at 5 seconds into the video
-ffmpeg -i input.mp4 -ss 5 -vframes 1 -f image2 thumb.jpg
+```
+2026-04-05T23:02:49Z  INFO streamvault: Upload dir: "/data/uploads"
+2026-04-05T23:02:49Z  INFO streamvault: Database: sqlite:///app/streamvault.db?mode=rwc
+2026-04-05T23:02:49Z  INFO streamvault: Database ready
+2026-04-05T23:02:49Z  INFO streamvault: StreamVault listening on 0.0.0.0:3000
+2026-04-05T23:05:52Z  INFO streamvault: Uploaded demo.mp4 (52428800 bytes) → token=a3f7bc12
 ```
 
-Store alongside HLS segments in R2. Serve at `/api/thumb/:token`. Replaces the current play-button placeholder in the video grid with actual video previews.
+HTTP request logging via `tower_http::TraceLayer`. Set `RUST_LOG=tower_http=debug` for per-request logs.
+
+### What's Missing
+
+- No metrics endpoint (no Prometheus, no request counts, no upload success rate)
+- No distributed tracing (no trace IDs across upload → transcode)
+- No alerting (no notification on error rate, disk usage, transcode failures)
+
+### Adding Prometheus Metrics
+
+```toml
+# Cargo.toml
+prometheus = "0.13"
+```
+
+```rust
+// Add to router
+.route("/metrics", get(metrics_handler))
+
+// handlers/metrics.rs
+pub async fn metrics_handler() -> String {
+    let encoder = TextEncoder::new();
+    encoder.encode_to_string(&prometheus::gather()).unwrap()
+}
+```
+
+Useful counters to add: `uploads_total`, `upload_bytes_total`, `stream_requests_total`, `transcode_success_total`, `transcode_failure_total`, `transcode_duration_seconds`.
 
 ---
 
-### Priority 7 — Upload Resume (TUS Protocol, $0)
+## 12. Known Issues & Roadmap
 
-For large files on unreliable connections, implement the [TUS resumable upload protocol](https://tus.io/). If an upload fails at 900MB, the user resumes from 900MB — not from zero. The `tus-axum` crate provides a drop-in implementation.
+### Active Issues
 
----
-
-### Budget Summary
-
-| Priority | Change | Cost | Impact |
-|---|---|---|---|
-| 1 | R2 + presigned URLs | $150/mo | Horizontal scaling, zero egress, CDN |
-| 2 | ABR HLS | $0 | Consistent playback on slow connections |
-| 3 | PostgreSQL (Neon) | $69/mo | Multi-node writes, durability |
-| 4 | Transcode workers | $150/mo | Independent scaling, queue depth control |
-| 5 | Sentry + Grafana | $126/mo | Full observability, error tracking |
-| 6 | Thumbnails | $0 | Better video grid UX |
-| 7 | TUS resume | $0 | Better UX for large uploads |
-| Infrastructure | 4 API nodes + misc | ~$286/mo | Multi-region, reliability |
-| **Total** | | **~$781/mo** | |
-
----
-
-## 9. Platform Comparisons
-
-### 9.1 StreamVault vs YouTube
-
-| Dimension | YouTube | StreamVault |
+| Issue | Root Cause | Fix |
 |---|---|---|
-| Upload processing | Mandatory transcoding to 10+ resolutions before playable (minutes-hours) | Playable immediately via byte-range, HLS in seconds |
-| Privacy | All uploads indexed even if "unlisted" — discoverable | No index, token-only access, no platform data collection |
-| Authentication | Google account required to upload | Fully anonymous |
-| File size limit | 256GB / 12 hours | 1GB (configurable in code) |
-| Codec output | VP9 / AV1 (re-encoded) | Original codec preserved |
-| Cost to operator | $0 (ad-supported) | $0-$1,000/mo depending on scale |
-| Use case | Public content discovery | Private one-click sharing |
+| Database wiped on `docker compose down -v` | SQLite inside container, `-v` deletes volumes | Mount host path: `./data/db:/app` in compose |
+| HLS segment dirs not cleaned on transcode failure | No cleanup in error path of `transcode_to_hls()` | Add `tokio::fs::remove_dir_all` on error return |
+
+### Roadmap
+
+**Before sharing publicly (P0):**
+- [ ] Rate limiting on upload endpoint
+- [ ] CORS restriction to your domain
+- [ ] Token expiry (`expires_at` column + enforcement)
+
+**Quality of life (P1):**
+- [ ] Video thumbnails (FFmpeg `-vframes 1` at 5 seconds)
+- [ ] Video duration in metadata (FFprobe after transcode)
+- [ ] Upload resume (TUS protocol)
+- [ ] Host-mounted database volume for persistence across `down -v`
+
+**Scale enablers (P2):**
+- [ ] Cloudflare R2 / S3 storage backend
+- [ ] Presigned download URLs
+- [ ] PostgreSQL (change `DATABASE_URL`)
+- [ ] ABR HLS (720p + 480p encode passes)
+
+**Operational (P3):**
+- [ ] Prometheus metrics endpoint
+- [ ] Structured request IDs
+- [ ] Transcode job queue (Redis) + worker binary
+- [ ] Automated cleanup job for expired videos
 
 ---
 
-### 9.2 StreamVault vs Vimeo
-
-| Dimension | Vimeo | StreamVault |
-|---|---|---|
-| Pricing | $7-75/month for meaningful storage | $0 free tier |
-| Transcoding | Cloud transcoding with review workflow | Immediate byte-range + background HLS |
-| Privacy controls | Domain restriction, password protection, review pages | Token-only (simpler but functional) |
-| Player | Polished branded player with chapters, CTAs | Native browser `<video>` element |
-| API | Full REST API with OAuth | Minimal REST API, no OAuth |
-| Self-hostable | No | Yes — full source, Docker deployment |
-
----
-
-### 9.3 StreamVault vs AWS MediaConvert + S3 + CloudFront
-
-| Dimension | AWS Stack | StreamVault |
-|---|---|---|
-| Setup complexity | IAM roles, S3 buckets, CloudFront distributions, MediaConvert jobs, Lambda triggers — days | `docker compose up` — minutes |
-| Cost at low scale | ~$5-30/month even for light use (MediaConvert + S3 + egress) | $0 |
-| Cost at scale (1TB/mo egress) | ~$92 egress + MediaConvert + S3 | ~$9 (R2, zero egress) |
-| Transcoding quality | Broadcast-quality, multi-codec, HDR, watermarking, captions | `-c:v copy` remux only |
-| Reliability | 99.99% SLA, multi-AZ, automatic failover | Single-region by default |
-| Vendor lock-in | High — proprietary APIs throughout | Low — portable Docker containers, S3-compatible storage |
-
----
-
-### 9.4 StreamVault vs Cloudflare Stream
-
-| Dimension | Cloudflare Stream | StreamVault on R2 |
-|---|---|---|
-| Pricing model | $5/1,000 min stored + $1/1,000 min delivered | Flat $0.015/GB storage, zero egress |
-| 1,000 hours stored | $300/month | ~$9/month (600GB × $0.015) |
-| Setup | REST API, automatic transcoding and HLS generation | Self-hosted, full control |
-| Player | Managed player with token protection, signed URLs built-in | Native `<video>`, manual token system |
-| Transcoding | Automatic multi-bitrate in minutes | `-c:v copy` in seconds, single bitrate |
-| Best for | Teams wanting managed infrastructure with SLA | Engineers wanting control and lower cost |
-
----
-
-### 9.5 Cost Comparison at Scale
-
-| Service | 100GB storage + 1TB/mo bandwidth |
-|---|---|
-| YouTube | $0 (but public, ad-supported) |
-| Vimeo Pro | ~$50/mo + storage limits |
-| AWS S3 + CloudFront | ~$100/mo (egress-dominated) |
-| Cloudflare Stream | ~$180/mo (per-minute pricing) |
-| Vimeo Enterprise | ~$900/mo |
-| **StreamVault on R2** | **~$17/mo** ($1.50 storage + $0 egress + $15 compute) |
-
----
-
-## 10. Security Considerations
-
-### 10.1 Current Protections
-
-| Protection | Implementation |
-|---|---|
-| Path traversal prevention | HLS segment names checked for `/` and `..` — rejected with 400 |
-| Content-type validation | Whitelist of MIME types. Extension-based inference if browser sends `application/octet-stream` |
-| Upload size enforcement | Dual: nginx `client_max_body_size 1100M` + Axum handler tracks bytes, rejects at 1GB |
-| Body limit on other routes | `DefaultBodyLimit::disable()` applied only to `/api/upload` — all other routes keep 2MB default |
-| Token entropy | 36^8 ≈ 2.8 trillion combinations — brute force at 1,000 req/sec takes ~88 years |
-| CORS | Currently permissive (`Any`) — restrict to your domain in production |
-
-### 10.2 Production Hardening Recommendations
-
-- **Rate limiting** — `tower-governor` crate: 10 uploads/hour per IP to prevent abuse
-- **Signed URLs with expiry** — Time-limited presigned URLs instead of persistent tokens for true access control
-- **Virus scanning** — ClamAV on uploaded files before they are served (videos can contain embedded malicious content)
-- **Content Security Policy** — CSP headers in nginx to prevent XSS via the frontend
-- **Expiry TTL** — Scheduled job to delete videos older than N days from storage and database
-- **HTTPS enforcement** — nginx redirects HTTP → HTTPS with HSTS headers in production
-
----
-
-## 11. Known Limitations & Future Work
-
-| Limitation | Impact | Resolution |
-|---|---|---|
-| Single bitrate HLS | Users on slow connections see buffering | Add 720p + 480p re-encode passes to transcode pipeline |
-| No video thumbnails | Video grid shows placeholder icons | `ffmpeg -vframes 1` thumbnail extraction in transcode pipeline |
-| SQLite single-writer | >100 concurrent uploads may see contention | Migrate to PostgreSQL (one env var change) |
-| No upload resume | Failed large uploads must restart | Implement TUS protocol or S3 multipart upload |
-| No expiry/cleanup | Storage grows unboundedly | Scheduled cleanup job for videos older than N days |
-| No video duration | Duration is NULL in database | Parse from FFmpeg output during transcode |
-| DB lost on `down -v` | `docker compose down -v` wipes the database | Mount a host directory for `/app/streamvault.db` |
-| No search | Videos only findable by token | Add full-text search on `original_name` in PostgreSQL |
-| FFmpeg unavailable | HLS silently skips, byte-range only | This is intentional graceful degradation |
-| No access revocation | Once shared, a token cannot be invalidated | Add a `revoked` boolean column and check it on each request |
-
----
-
-## 12. Architecture Summary
-
-StreamVault achieves its primary goal — minimal time-to-stream — through a deliberate separation of concerns:
-
-- **Upload path** writes to disk and returns immediately
-- **Streaming path** reads and seeks with zero transcoding dependency
-- **HLS path** improves playback quality asynchronously without blocking either
-
-The architecture has clean upgrade seams at every layer:
-
-```
-SQLite          → PostgreSQL      (one environment variable)
-Local disk      → S3 / R2         (add object storage client)
-Single node     → Multi-node      (remove local disk dependency)
-tokio::spawn    → Worker pool     (add message queue)
-Byte-range only → ABR HLS         (add FFmpeg re-encode pass)
-```
-
-At **$0/month** on Fly.io free tier, it handles personal and team use comfortably.  
-At **$1,000/month** with R2, Neon, dedicated workers, and full observability, it handles tens of thousands of concurrent viewers.
-
-The code doesn't change between those two tiers — only the infrastructure it runs on.
-
-> **Core Principle:** *"Make it work on the smallest instance first, with clean seams where paid services plug in."*  
-> Every component in StreamVault can be independently upgraded without touching the others.
-
----
-
-*StreamVault — Built with Rust + Axum + SQLite + Docker*
+*StreamVault · Rust · Axum · SQLite · Docker*
