@@ -1,0 +1,23 @@
+# Rust
+target/
+Cargo.lock
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Uploads
+uploads/
+backend/uploads/
+
+# Docker
+.env
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
