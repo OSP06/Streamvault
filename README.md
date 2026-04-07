@@ -2,7 +2,7 @@
 
 A minimal private video streaming service. Upload any video file up to 1 GB and receive a token-based shareable link for immediate in-browser streaming — no account required, no transcoding delay.
 
-**Stack:** Rust · Axum 0.7 · SQLite (SQLx) · FFmpeg · nginx · Docker
+**Stack:** Rust · Axum 0.7 · SQLite (SQLx) · FFmpeg · SvelteKit · nginx · Docker
 
 ---
 
@@ -32,13 +32,24 @@ cd streamvault
 docker compose up --build
 ```
 
-Wait for this line in the output:
+Wait for both services to show as ready — the full startup sequence looks like this:
 
 ```
+backend-1  | INFO streamvault: Upload dir: "/data/uploads"
+backend-1  | INFO streamvault: Database: sqlite:///app/streamvault.db?mode=rwc
+backend-1  | INFO streamvault: Database ready
 backend-1  | INFO streamvault: StreamVault listening on 0.0.0.0:3000
+frontend-1 | Configuration complete; ready for start up
 ```
 
 Then open **http://localhost** in your browser.
+
+> **What a successful upload looks like in the logs:**
+> ```
+> backend-1 | INFO streamvault::handlers::upload: Uploaded video.mp4 (66759298 bytes) → token=wfuwbioe
+> backend-1 | INFO streamvault::streaming: HLS transcode complete for token=wfuwbioe
+> ```
+> The upload response is returned instantly. HLS completes ~1 second later in the background.
 
 > **Note on first build time:** The Rust compiler downloads and compiles all dependencies from scratch on the first build. This is a one-time cost — Docker caches the compiled dependencies layer, so subsequent builds after source changes take ~15 seconds.
 
@@ -73,9 +84,24 @@ streamvault/
 │   ├── Cargo.toml
 │   └── Dockerfile
 ├── frontend/
-│   ├── index.html              # Complete SPA — no build step required
-│   ├── nginx.conf              # Reverse proxy config
-│   └── Dockerfile
+│   ├── src/
+│   │   ├── routes/
+│   │   │   ├── +page.svelte              # Home page — upload form + video grid
+│   │   │   ├── +layout.svelte            # Root layout, imports global CSS
+│   │   │   ├── +layout.ts                # SPA mode: ssr=false, prerender=false
+│   │   │   └── watch/[token]/
+│   │   │       └── +page.svelte          # Video player page
+│   │   ├── lib/components/
+│   │   │   ├── UploadZone.svelte         # Drag-drop upload with XHR progress bar
+│   │   │   ├── VideoGrid.svelte          # Video card grid with HLS badge
+│   │   │   └── Toast.svelte              # Success/error toast notifications
+│   │   ├── app.html                      # SvelteKit HTML shell (%sveltekit.body%)
+│   │   └── app.css                       # CSS custom properties + global base styles
+│   ├── svelte.config.js                  # @sveltejs/adapter-static config
+│   ├── vite.config.js                    # Vite + SvelteKit plugin, dev proxy
+│   ├── package.json                      # svelte, @sveltejs/kit, vite deps
+│   ├── nginx.conf                        # Reverse proxy + streaming config
+│   └── Dockerfile                        # node:20-alpine build → nginx:alpine serve
 ├── docs/
 │   └── ARCHITECTURE.md         # Full system design document
 ├── docker-compose.yml
@@ -83,9 +109,6 @@ streamvault/
 └── README.md
 ```
 
-### Why a Single `index.html` Frontend?
-
-The frontend is a single self-contained HTML file with no build step, no npm, and no node_modules. This was a deliberate choice: SvelteKit and similar frameworks require `npm install` during Docker build, which pulls packages from the internet and introduced repeated build failures in CI-like environments. A single HTML file with vanilla JS has zero dependencies, builds in milliseconds, and is fully functional.
 
 ---
 
@@ -311,7 +334,7 @@ The token is 8 characters from the set `[a-z0-9]` (36 characters). That gives 36
 
 **Requirements:**
 - [Rust](https://rustup.rs) (stable, 1.85+)
-- [Node.js](https://nodejs.org) is **not** required — the frontend has no build step
+- [Node.js](https://nodejs.org) 18+ — required for the Svelte frontend build
 
 ### Backend
 
@@ -330,23 +353,20 @@ cargo test
 
 The backend listens on `http://localhost:3000` by default.
 
-### Frontend
-
-The frontend is a static `index.html` file. Serve it with any static file server that proxies `/api/*` to the backend:
+### Frontend (Svelte)
 
 ```bash
 cd frontend
 
-# Option 1: Python (no install)
-python3 -m http.server 8080
-# Then manually proxy API calls — open http://localhost:8080
-# (API calls will fail without a proxy — use Option 2)
-
-# Option 2: npx serve with proxy (requires Node.js)
-npx serve -l 8080
+npm install
+npm run dev
+# Opens at http://localhost:5173
+# Proxies /api/* to http://localhost:3000 (configured in vite.config.js)
 ```
 
-Or just use Docker Compose for local development — it wires everything up correctly.
+The Vite dev server supports hot module replacement — Svelte components update instantly on save without a full page reload.
+
+> **Note:** The backend must be running on :3000 for API calls to work. Start it first in a separate terminal.
 
 ### Database
 
@@ -369,7 +389,7 @@ sqlite> SELECT COUNT(*) FROM videos;
 | Change database schema | `src/db.rs` (`migrate()` function) |
 | Change what upload metadata is stored | `src/models.rs` + `src/db.rs` (`insert_video`) |
 | Change HLS transcode settings | `src/streaming.rs` (FFmpeg args) |
-| Change frontend UI | `frontend/index.html` |
+| Change frontend UI | `frontend/src/routes/+page.svelte` (home), `watch/[token]/+page.svelte` (player), `src/lib/components/` (shared components) |
 | Change nginx config | `frontend/nginx.conf` |
 
 ---
