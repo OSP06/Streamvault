@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      UPLOAD_DIR: /data/uploads
+      DB_PATH: /app/streamvault.db
+      BASE_URL: http://localhost
+      BIND_ADDR: 0.0.0.0:3000
+      RUST_LOG: streamvault=info
+    volumes:
+      - video_data:/data/uploads
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  video_data:
+    driver: local
