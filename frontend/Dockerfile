@@ -3,9 +3,10 @@ FROM node:20-alpine AS builder
 
 WORKDIR /build
 
-# Copy package files and install dependencies
+# Copy package files and install dependencies & regenerates lock — intentional since lockfile is placeholder
 COPY package.json ./
-RUN npm install
+RUN npm install      
+
 
 # Copy all source and build
 COPY . .
