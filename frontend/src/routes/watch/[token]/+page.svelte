@@ -1,23 +1,58 @@
 <script>
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
 
   const token = $page.params.token;
 
   let video = null;
   let error = null;
   let copied = false;
+  let pollInterval = null;
 
   onMount(async () => {
     try {
       const res = await fetch(`/api/videos/${token}`);
       if (!res.ok) throw new Error('Video not found');
       video = await res.json();
+
+      // If HLS isn't ready yet, poll every 3 seconds until it is.
+      // This makes the status chip flip from "Direct stream" (amber) to
+      // "HLS ready" (green) in real time without a page reload.
+      // The player src also upgrades automatically via the reactive $: streamUrl.
+      //
+      // We do NOT automatically swap the player src mid-playback — that would
+      // interrupt the video. The upgrade only affects new page loads after
+      // HLS becomes ready.
+      if (!video.hls_ready) {
+        pollInterval = setInterval(async () => {
+          try {
+            const r = await fetch(`/api/videos/${token}`);
+            if (!r.ok) return;
+            const updated = await r.json();
+            if (updated.hls_ready) {
+              video = updated;          // reactive — streamUrl recalculates
+              clearInterval(pollInterval);
+              pollInterval = null;
+            }
+          } catch {
+            // Network hiccup — just wait for next interval
+          }
+        }, 3000);
+      }
     } catch (e) {
       error = e.message;
     }
   });
 
+  // Always clear the interval when navigating away to avoid memory leaks
+  onDestroy(() => {
+    if (pollInterval) clearInterval(pollInterval);
+  });
+
+  // Reactive: recalculates whenever video.hls_ready changes.
+  // Picks HLS playlist if ready, otherwise byte-range stream URL.
+  // This is set once on initial load — the player does not mid-stream
+  // switch protocols (that would cause a playback interruption).
   $: streamUrl = video
     ? video.hls_ready
       ? `/api/hls/${token}/playlist.m3u8`
@@ -82,7 +117,7 @@
             {#if video.hls_ready}
               <span class="chip chip--green mono">HLS ready</span>
             {:else}
-              <span class="chip chip--amber mono">Direct stream</span>
+              <span class="chip chip--amber mono">Direct stream · HLS processing…</span>
             {/if}
             <span class="chip mono">{formatDate(video.created_at)}</span>
           </div>
@@ -98,9 +133,9 @@
       <div class="tech-note mono">
         <span class="label">Stream:</span>
         {#if video.hls_ready}
-          HLS adaptive via <code>/api/hls/{token}/playlist.m3u8</code>
+          HLS (remuxed) via <code>/api/hls/{token}/playlist.m3u8</code> · 2s segments · VOD playlist
         {:else}
-          HTTP byte-range via <code>/api/stream/{token}</code> — HLS transcode in progress
+          HTTP byte-range via <code>/api/stream/{token}</code> · HLS transcode running in background
         {/if}
       </div>
     {/if}

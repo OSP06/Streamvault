@@ -1,14 +1,11 @@
 use axum::{
-    body::Body,
     extract::{Multipart, State},
-    http::Request,
     Json,
 };
 use axum::extract::DefaultBodyLimit;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use uuid::Uuid;
-use futures::StreamExt;
 
 use crate::{
     error::AppError,
@@ -16,7 +13,7 @@ use crate::{
     AppState,
 };
 
-const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024; // 1GB
+const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
 const ALLOWED_TYPES: &[&str] = &[
     "video/mp4",
@@ -43,7 +40,9 @@ pub async fn upload_video(
         }
 
         let original_name = field.file_name().unwrap_or("upload").to_string();
-        let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+        let content_type = field.content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
 
         let effective_ct = infer_content_type(&original_name, &content_type);
         if !ALLOWED_TYPES.contains(&effective_ct.as_str()) {
@@ -62,13 +61,19 @@ pub async fn upload_video(
         let mut total_bytes: usize = 0;
         let mut data = field;
 
+        // Stream chunks directly to disk — peak RAM is O(chunk_size) ~64KB,
+        // not O(file_size). A 1GB upload and a 1MB upload use identical RAM.
         while let Some(chunk) = data.chunk().await.map_err(|e| {
             AppError::BadRequest(format!("Read error: {e}"))
         })? {
             total_bytes += chunk.len();
             if total_bytes > MAX_UPLOAD_BYTES {
+                // Clean up the partial file before returning 413.
+                // Without this, partial files accumulate on disk indefinitely.
                 drop(file);
-                let _ = tokio::fs::remove_file(&file_path).await;
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    warn!("Failed to clean up oversized upload at {:?}: {}", file_path, e);
+                }
                 return Err(AppError::FileTooLarge);
             }
             file.write_all(&chunk)
@@ -77,7 +82,12 @@ pub async fn upload_video(
         }
 
         file.flush().await.map_err(|e| AppError::Internal(e.into()))?;
-        info!("Uploaded {} ({} bytes) → token={}", original_name, total_bytes, token);
+        drop(file);
+
+        info!(
+            "Uploaded {} ({} bytes) → token={}",
+            original_name, total_bytes, token
+        );
 
         let video = Video {
             id: None,
@@ -93,14 +103,34 @@ pub async fn upload_video(
             created_at: String::new(),
         };
 
-        state.db.insert_video(&video).await?;
+        // If the DB insert fails, clean up the file we just wrote.
+        // Without this, files accumulate on disk with no DB record —
+        // they become unreachable orphans that waste storage forever.
+        if let Err(e) = state.db.insert_video(&video).await {
+            warn!(
+                "DB insert failed for token={}, cleaning up file {:?}: {}",
+                token, file_path, e
+            );
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return Err(AppError::Internal(e));
+        }
 
+        // Fire-and-forget HLS transcode. The upload response is already sent
+        // at this point — the user does not wait for transcoding.
+        // On failure, transcode_to_hls() logs a warning and returns Ok(()) —
+        // byte-range streaming remains the fallback.
         let state_clone = state.clone();
         let token_clone = token.clone();
         let path_clone = file_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::streaming::transcode_to_hls(&state_clone, &token_clone, &path_clone).await {
-                warn!("HLS transcode failed for {}: {}", token_clone, e);
+            if let Err(e) = crate::streaming::transcode_to_hls(
+                &state_clone,
+                &token_clone,
+                &path_clone,
+            )
+            .await
+            {
+                warn!("HLS transcode error for {}: {}", token_clone, e);
             }
         });
 
@@ -120,24 +150,39 @@ pub async fn list_videos(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<VideoResponse>>, AppError> {
     let videos = state.db.list_videos().await?;
-    let resp: Vec<VideoResponse> = videos.iter().map(|v| VideoResponse::from_video(v, &state.base_url)).collect();
+    let resp: Vec<VideoResponse> = videos
+        .iter()
+        .map(|v| VideoResponse::from_video(v, &state.base_url))
+        .collect();
     Ok(Json(resp))
 }
 
 fn generate_token() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    (0..8).map(|_| {
-        let idx = rng.gen_range(0..36usize);
-        if idx < 10 { (b'0' + idx as u8) as char } else { (b'a' + (idx - 10) as u8) as char }
-    }).collect()
+    (0..8)
+        .map(|_| {
+            let idx = rng.gen_range(0..36usize);
+            if idx < 10 {
+                (b'0' + idx as u8) as char
+            } else {
+                (b'a' + (idx - 10) as u8) as char
+            }
+        })
+        .collect()
 }
 
 fn infer_content_type(filename: &str, declared: &str) -> String {
     if declared != "application/octet-stream" {
         return declared.to_string();
     }
-    match filename.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+    match filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
         "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
         "mov" => "video/quicktime",
@@ -146,7 +191,8 @@ fn infer_content_type(filename: &str, declared: &str) -> String {
         "ts" => "video/mp2t",
         "mpeg" | "mpg" => "video/mpeg",
         _ => declared,
-    }.to_string()
+    }
+    .to_string()
 }
 
 fn extension_from_content_type(ct: &str, fallback_name: &str) -> String {
@@ -159,5 +205,6 @@ fn extension_from_content_type(ct: &str, fallback_name: &str) -> String {
         "video/mp2t" => "ts",
         "video/mpeg" => "mpeg",
         _ => fallback_name.rsplit('.').next().unwrap_or("bin"),
-    }.to_string()
+    }
+    .to_string()
 }

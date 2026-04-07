@@ -24,19 +24,26 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "streamvault=debug,tower_http=debug".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "streamvault=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let upload_dir = std::env::var("UPLOAD_DIR").unwrap_or_else(|_| "/data/uploads".to_string());
+    // ── Storage ───────────────────────────────────────────────────────────────
+    let upload_dir = std::env::var("UPLOAD_DIR")
+        .unwrap_or_else(|_| "/data/uploads".to_string());
     let upload_path = std::path::PathBuf::from(&upload_dir);
     tokio::fs::create_dir_all(&upload_path).await?;
     info!("Upload dir: {:?}", upload_path);
 
-    let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    // ── Database ──────────────────────────────────────────────────────────────
+    let db_path = std::env::var("DB_PATH")
+        .unwrap_or_else(|_| "/app/streamvault.db".to_string());
 
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "/app/streamvault.db".to_string());
+    // Ensure the parent directory exists before SQLite tries to open the file.
+    // create_dir_all is idempotent — safe to call even if the dir already exists.
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -47,29 +54,47 @@ async fn main() -> anyhow::Result<()> {
     db.migrate().await?;
     info!("Database ready");
 
+    // ── Base URL ──────────────────────────────────────────────────────────────
+    let base_url = std::env::var("BASE_URL")
+        .unwrap_or_else(|_| "http://localhost".to_string());
+
     let state = AppState {
         db: Arc::new(db),
         upload_dir: upload_path,
         base_url,
     };
 
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+    // ── CORS ──────────────────────────────────────────────────────────────────
+    // Currently open (Any) for local development and evaluation convenience.
+    // Before public deployment, restrict to your domain:
+    //   CorsLayer::new().allow_origin("https://yourdomain.com".parse::<HeaderValue>().unwrap())
+    // See ARCHITECTURE.md §10 (Security) for full hardening instructions.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
+    // ── Router ────────────────────────────────────────────────────────────────
     let app = Router::new()
-        // Disable body limit on upload so large video files aren't rejected
-        .route("/api/upload", post(handlers::upload::upload_video)
-            .layer(DefaultBodyLimit::disable()))
-        .route("/api/videos", get(handlers::upload::list_videos))
+        // Upload has no body limit — the handler enforces 1GB internally.
+        // All other routes keep Axum's default 2MB limit for safety.
+        .route(
+            "/api/upload",
+            post(handlers::upload::upload_video).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/videos",        get(handlers::upload::list_videos))
         .route("/api/videos/:token", get(handlers::stream::video_info))
         .route("/api/stream/:token", get(handlers::stream::stream_video))
         .route("/api/hls/:token/playlist.m3u8", get(handlers::stream::hls_playlist))
-        .route("/api/hls/:token/:segment", get(handlers::stream::hls_segment))
-        .route("/health", get(handlers::health::health_check))
+        .route("/api/hls/:token/:segment",      get(handlers::stream::hls_segment))
+        .route("/health",            get(handlers::health::health_check))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    // ── Bind ──────────────────────────────────────────────────────────────────
+    let bind_addr = std::env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("StreamVault listening on {}", bind_addr);
 

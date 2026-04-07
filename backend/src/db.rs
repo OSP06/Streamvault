@@ -12,12 +12,35 @@ impl Database {
             .max_connections(10)
             .connect(url)
             .await?;
+
+        // Enable WAL mode immediately after connecting.
+        //
+        // Default SQLite journal mode (DELETE) takes an exclusive write lock
+        // on the entire database file for every write — reads block during
+        // uploads. WAL (Write-Ahead Logging) allows concurrent reads while a
+        // write is in progress, which matters for a streaming service where
+        // token-lookup reads vastly outnumber upload writes.
+        //
+        // synchronous=NORMAL is safe with WAL — it provides crash safety
+        // without the performance cost of synchronous=FULL (the default).
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await?;
+        // Increase the page cache to 8MB (default is ~2MB).
+        // Reduces disk I/O on repeated token lookups.
+        sqlx::query("PRAGMA cache_size=-8000")
+            .execute(&pool)
+            .await?;
+
         Ok(Self { pool })
     }
 
     pub async fn migrate(&self) -> Result<()> {
         // Run each statement separately — SQLx SQLite does not support
-        // multiple statements in a single execute() call
+        // multiple statements in a single execute() call.
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS videos (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
