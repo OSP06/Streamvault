@@ -149,6 +149,26 @@ backend/src/
     └── health.rs  health_check() — returns {"status":"ok"}.
 ```
 
+```
+frontend/src/
+├── routes/
+│   ├── +layout.ts            SSR disabled (ssr = false), SPA mode
+│   ├── +layout.svelte        Imports app.css, wraps all pages with <slot />
+│   ├── +page.svelte          Home: onMount fetches /api/videos, renders
+│   │                         UploadZone + VideoGrid, handles success/error events
+│   └── watch/[token]/
+│       └── +page.svelte      Player: fetches /api/videos/:token on mount,
+│                             reactive streamUrl picks HLS or byte-range based
+│                             on hls_ready flag
+├── lib/components/
+│   ├── UploadZone.svelte     XHR upload (not fetch — needed for progress events),
+│   │                         drag-and-drop, validates file type + size client-side
+│   ├── VideoGrid.svelte      Renders video cards, each links to /watch/:token
+│   └── Toast.svelte          Fixed-position notification, auto-dismisses
+├── app.html                  SvelteKit HTML shell — required file
+└── app.css                   CSS custom properties (--bg, --accent, etc.)
+```
+
 ---
 
 ## 3. Data Model
@@ -360,13 +380,25 @@ Absolute path (`/app/streamvault.db`) instead of relative path: relative paths r
 
 ---
 
-### 5.6 Single `index.html` frontend, no build step
+### 5.6 SvelteKit frontend with static adapter
 
-**Chosen:** Vanilla JS SPA in a single `index.html`. nginx serves it with `COPY index.html`.
+**Chosen:** SvelteKit with `@sveltejs/adapter-static`, built in Docker using `node:20-alpine`, served by `nginx:alpine`.
 
-**Why:** A framework frontend requires `npm install` during Docker build, which pulls packages from the internet. This introduced repeated failures during development (missing `app.html`, missing `svelte.config.js`, ESM-only errors, `"type":"module"` missing from package.json, etc.). A single HTML file has zero dependencies and builds in milliseconds.
+**Why:** Svelte is the preferred stack per the brief. SvelteKit provides file-based routing (the `/watch/:token` route maps directly to `src/routes/watch/[token]/+page.svelte`), reactive state management via Svelte stores, and scoped CSS per component. The `adapter-static` outputs a fully pre-compiled static bundle — at runtime nginx serves plain HTML/JS/CSS files with no Node.js process running.
 
-**Trade-off:** No TypeScript, no component system, no hot module replacement in development. Acceptable for a UI this simple.
+**Component structure:**
+- `+page.svelte` — home page: upload zone + video grid, reactive `videos` array updated on upload
+- `watch/[token]/+page.svelte` — player page: fetches metadata on mount, selects HLS vs byte-range stream URL via reactive `$:` declaration
+- `UploadZone.svelte` — encapsulates XHR upload with `createEventDispatcher` for `success`/`error` events to the parent
+- `VideoGrid.svelte` — receives `videos` prop, renders card grid
+- `Toast.svelte` — receives `type` and `message` props, self-contained notification
+
+**Key configuration:**
+- `ssr = false` in `+layout.ts` — disables server-side rendering for SPA mode
+- `fallback: 'index.html'` in `svelte.config.js` — nginx serves `index.html` for all unknown paths, enabling client-side routing
+- `vite.config.js` dev proxy: `/api → http://localhost:3000` for local development without Docker
+
+**Trade-off:** The Docker build requires internet access for `npm install`. This is standard for any Node.js project and is handled correctly by Docker's layer caching — subsequent builds after source changes skip the install step entirely.
 
 ---
 
