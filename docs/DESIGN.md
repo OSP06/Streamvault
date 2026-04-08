@@ -1,56 +1,44 @@
 # StreamVault — System Design
 
-> This document describes the **current implementation**: how it works, why each piece was
-> built the way it was, what was measured, and where the edges are.
-> For the production scaling roadmap, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+This document covers the current implementation: what was built, why, and what was
+learned along the way. For the production scaling path, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ---
 
-## Contents
+## The Problem Worth Solving First
 
-1. [The Core Problem](#1-the-core-problem)
-2. [Component Map](#2-component-map)
-3. [Data Model](#3-data-model)
-4. [Request Flows](#4-request-flows)
-5. [Design Decisions](#5-design-decisions)
-6. [Performance Characteristics](#6-performance-characteristics)
-7. [Edge Cases & Failure Modes](#7-edge-cases--failure-modes)
-8. [Security Model](#8-security-model)
-9. [Observability](#9-observability)
-10. [Known Limitations](#10-known-limitations)
+The spec asks for time-to-stream to be prioritised over quality. That sounds simple
+until you realise it creates a hard conflict: any processing step before playback
+violates the primary requirement, but serving raw uploaded files produces inconsistent
+seek behaviour on large videos.
 
----
-
-## 1. The Core Problem
-
-The spec prioritises **time-to-stream** over video quality. This creates a direct conflict:
-any processing step that runs before the video is watchable violates the primary requirement.
-
-The central design question is: *how do you offer both instant availability and good streaming quality?*
-
-**Answer: dual-streaming protocol.**
+The answer I landed on is a **dual-streaming protocol**. Upload completes, the raw
+file is immediately streamable via HTTP Range requests. FFmpeg runs in the background
+and remuxes to HLS — the player upgrades silently when it's done. The user never waits.
 
 ```
 Upload completes
     │
-    ├──→ HTTP byte-range stream   (available: immediately)
-    │    Raw file, served with Accept-Ranges: bytes
-    │    Seek support: O(1) via file offset
+    ├──→ HTTP byte-range stream       available: immediately
+    │    raw file, Accept-Ranges: bytes, O(1) seek
     │
-    └──→ tokio::spawn(ffmpeg)     (available: ~1-10s later)
-         Remux → HLS segments
-         hls_ready = TRUE once complete
-         Player upgrades silently
+    └──→ tokio::spawn(ffmpeg -c:v copy)   available: ~250ms–13s later
+         remux → HLS segments
+         UPDATE videos SET hls_ready = TRUE
+         player upgrades automatically
 ```
 
-The user starts watching before FFmpeg has processed a single frame. The HLS upgrade
-happens invisibly in the background.
+What makes this work in practice is `-c:v copy`. FFmpeg copies the bitstream verbatim
+without decoding or re-encoding — it is entirely I/O-bound. On the real test videos
+(see [benchmarks/RESULTS.md](../benchmarks/RESULTS.md)), a 101MB file is HLS-ready
+in 623ms. A 644MB `.mov` file in 4.7s. The outliers are the long-form Blender movies
+(ElephantsDream, Sintel) at 9-13 seconds — not because they're large, but because
+they're 10-15 minute films with ~300-450 segment files to write. HLS time is driven
+by duration, not file size.
 
 ---
 
-## 2. Component Map
-
-### Runtime Topology
+## System Layout
 
 ```
                       ┌────────────────────────┐
@@ -59,116 +47,58 @@ happens invisibly in the background.
                                  │ HTTP :80
                       ┌──────────▼─────────────┐
                       │     nginx (alpine)      │
-                      │                        │
-                      │  GET /          ──────────→ index.html (static SPA)
-                      │  GET /watch/*   ──────────→ index.html (SPA fallback)
-                      │  /api/*         ──────────→ proxy → backend:3000
-                      │                        │
-                      │  proxy_buffering off    │  ← critical for streaming
-                      │  client_max_body_size   │
-                      │    1100M               │
+                      │  /api/*  → backend:3000 │
+                      │  /health → backend:3000 │
+                      │  /*      → index.html   │
+                      │  proxy_buffering off    │
                       └──────────┬─────────────┘
-                   Docker internal network
+                                 │
                       ┌──────────▼─────────────┐
                       │    Rust / Axum 0.7      │
-                      │    (backend:3000)       │
-                      │                        │
-                      │  POST /api/upload       │
-                      │  GET  /api/stream/:tok  │
-                      │  GET  /api/hls/:tok/*   │
-                      │  GET  /api/videos[/:t]  │
-                      │  GET  /health           │
+                      │      :3000              │
                       └───────┬──────────┬──────┘
                               │          │
             ┌─────────────────▼──┐  ┌────▼───────────────────┐
-            │  SQLite             │  │  Filesystem             │
-            │  /app/              │  │  Docker volume          │
-            │  streamvault.db     │  │  /data/uploads/         │
-            │                    │  │                         │
-            │  videos table      │  │  {uuid}.mp4             │
-            │  token index       │  │  hls/{token}/           │
-            │  hls_ready flag    │  │    playlist.m3u8        │
+            │  SQLite (WAL mode)  │  │  /data/uploads/         │
+            │  /app/streamvault   │  │  {uuid}.mp4             │
+            │  .db                │  │  hls/{token}/           │
+            │  token index        │  │    playlist.m3u8        │
             └────────────────────┘  │    seg000.ts ...        │
-                                    └─────────────────────────┘
-                                              ▲
-                                   ┌──────────┴──────────┐
-                                   │  FFmpeg subprocess   │
-                                   │  (background task)   │
-                                   │  -c:v copy           │
-                                   │  -hls_time 2         │
-                                   └─────────────────────-┘
+                                    └──────────┬──────────────┘
+                                               │
+                                    ┌──────────▼──────────┐
+                                    │  FFmpeg subprocess   │
+                                    │  (tokio::spawn)      │
+                                    │  -c:v copy           │
+                                    │  -hls_time 2         │
+                                    └─────────────────────-┘
 ```
 
-### Codebase Map
+**Backend** — Rust/Axum. Five source files:
 
-```
-backend/src/
-├── main.rs        Entry point. Builds the Axum router, wires AppState,
-│                  binds the TCP listener. Creates upload dir and DB parent
-│                  dir at startup before anything else runs.
-│
-├── db.rs          All database interaction. SqlitePool wrapped in a
-│                  Database struct. Schema migration runs two separate
-│                  execute() calls — SQLx SQLite does not support multiple
-│                  statements in one call. No compile-time query macros —
-│                  uses runtime queries + manual row mapping to avoid
-│                  requiring DATABASE_URL at cargo build time.
-│
-├── models.rs      Plain Rust structs with Serde derives.
-│                  Video         — database row shape
-│                  VideoResponse — API response (adds stream_url, share_url)
-│                  UploadResponse — returned immediately after upload
-│
-├── error.rs       AppError enum. Variants map to HTTP status codes via
-│                  IntoResponse. All handler return types use this error.
-│
-├── streaming.rs   Single function: transcode_to_hls(). Shells out to ffmpeg.
-│                  Returns Ok(()) even on failure — system degrades gracefully
-│                  to byte-range streaming if FFmpeg is absent or crashes.
-│
-└── handlers/
-    ├── upload.rs  upload_video() — streams multipart to disk in chunks.
-    │              list_videos()  — returns all videos ordered by created_at.
-    │
-    ├── stream.rs  video_info()   — metadata lookup by token.
-    │              stream_video() — HTTP Range streaming with seek support.
-    │              hls_playlist() — serves m3u8 or 307s to raw stream.
-    │              hls_segment()  — serves individual .ts segment files.
-    │
-    └── health.rs  health_check() — returns {"status":"ok"}.
-```
+- `main.rs` — router setup, AppState wiring, startup checks (creates upload dir and DB parent before anything else)
+- `db.rs` — SQLitePool + four queries. No compile-time macros (explained below)
+- `handlers/upload.rs` — streams multipart to disk, spawns background transcode
+- `handlers/stream.rs` — HTTP Range serving, HLS playlist/segment serving, 307 fallback
+- `streaming.rs` — single function that shells out to FFmpeg. Returns `Ok(())` on any failure — HLS is an enhancement, not a hard dependency
 
-```
-frontend/src/
-├── routes/
-│   ├── +layout.ts            SSR disabled (ssr = false), SPA mode
-│   ├── +layout.svelte        Imports app.css, wraps all pages
-│   ├── +page.svelte          Home: upload zone + video grid
-│   └── watch/[token]/
-│       └── +page.svelte      Player: HLS vs byte-range selection, polling
-├── lib/components/
-│   ├── UploadZone.svelte     XHR upload with progress events (not fetch)
-│   ├── VideoGrid.svelte      Video card grid
-│   └── Toast.svelte          Auto-dismissing notifications
-```
+**Frontend** — SvelteKit with `adapter-static`. Builds to a static bundle served by nginx at runtime, no Node.js process. Two routes: home (upload + grid) and `/watch/:token` (player with protocol selection logic).
 
 ---
 
-## 3. Data Model
-
-### Schema
+## Data Model
 
 ```sql
 CREATE TABLE videos (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    token         TEXT NOT NULL UNIQUE,      -- 8-char share token e.g. "a3f7bc12"
-    filename      TEXT NOT NULL,             -- UUID on disk: prevents collisions + traversal
-    original_name TEXT NOT NULL,             -- user's filename, for display only
-    content_type  TEXT NOT NULL,             -- MIME type validated on upload
+    token         TEXT NOT NULL UNIQUE,
+    filename      TEXT NOT NULL,       -- UUID on disk, never user-controlled
+    original_name TEXT NOT NULL,       -- display only, never used in file paths
+    content_type  TEXT NOT NULL,
     size_bytes    INTEGER NOT NULL,
-    duration_secs REAL,                      -- NULL: requires FFprobe, adds latency
-    width         INTEGER,                   -- NULL: same reason
-    height        INTEGER,                   -- NULL: same reason
+    duration_secs REAL,                -- NULL: not populated yet (needs FFprobe)
+    width         INTEGER,             -- NULL: same reason
+    height        INTEGER,             -- NULL: same reason
     hls_ready     BOOLEAN NOT NULL DEFAULT FALSE,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -176,443 +106,287 @@ CREATE TABLE videos (
 CREATE INDEX idx_videos_token ON videos(token);
 ```
 
-### Why `filename` ≠ `original_name`
+`filename` and `original_name` are kept separate deliberately. `filename` is a
+server-generated UUID and is the only value that ever touches the filesystem.
+`original_name` is what the user called the file — it's shown in the UI and never
+used to construct a path. If I used `original_name` for disk I/O, a file named
+`../../etc/passwd` would be a path traversal.
 
-`filename` is a server-generated UUID (`3f8a2c1d-...mp4`). It is the only value ever
-used to construct a file path. `original_name` is preserved for display and never
-touches the filesystem. Swapping them would introduce a path traversal vulnerability —
-a user could upload a file named `../../etc/passwd`.
+The `duration_secs`, `width`, and `height` columns are nullable. They require
+an FFprobe call, which adds latency to the upload response if done synchronously.
+They're in the schema because they're the right fields to have, not because they're
+populated — a follow-up FFprobe after HLS completes would fill them in without any
+schema change.
 
-### SQLite Tuning
-
+**SQLite tuning:**
 ```sql
-PRAGMA journal_mode=WAL;        -- readers don't block writer; writer doesn't block readers
-PRAGMA synchronous=NORMAL;      -- crash-safe without full fsync cost
-PRAGMA cache_size=-8000;        -- 8MB page cache (default ~2MB) to reduce disk I/O
+PRAGMA journal_mode=WAL;       -- concurrent reads don't block writes
+PRAGMA synchronous=NORMAL;     -- crash-safe, without the full fsync cost
+PRAGMA cache_size=-8000;       -- 8MB page cache vs 2MB default
 ```
 
-WAL mode is critical here: during an upload, the writer is inserting a row while concurrent
-readers may be serving the video list or metadata. Without WAL, every read blocks until the
-write completes.
+WAL is critical here because during an upload write (INSERT), concurrent readers are
+serving the video list and metadata. Without WAL, those reads block on the write lock.
 
-### File Layout
-
+**File layout on disk:**
 ```
 /data/uploads/
-├── 3f8a2c1d-4b5e-6789-abcd-ef0123456789.mp4   ← raw upload (UUID filename)
+├── 3f8a2c1d-4b5e-6789-abcd-ef0123456789.mp4
 └── hls/
-    └── a3f7bc12/                               ← token as directory name
+    └── a3f7bc12/
         ├── playlist.m3u8
         ├── seg000.ts
-        ├── seg001.ts
-        └── seg002.ts
+        └── seg001.ts
 ```
 
 ---
 
-## 4. Request Flows
+## Request Flows
 
-### 4.1 Upload
+### Upload
 
 ```
-Browser
-  │  POST /api/upload
-  │  Content-Type: multipart/form-data
+Browser  POST /api/upload  (multipart/form-data)
+  │
   ▼
 nginx  [proxy_request_buffering off]
-  │  Bytes pass through immediately — no nginx accumulation
+  │   bytes stream through — nginx never buffers the body
   ▼
 Axum  [DefaultBodyLimit::disable() on this route only]
   │
-  │  Multipart field "video":
-  │    validate MIME type against allowlist
-  │    generate: uuid filename + 8-char token
-  │    File::create(upload_dir / uuid_filename)
+  │  validate MIME type against allowlist
+  │  generate: UUID filename + 8-char token
+  │  open file on disk
   │
-  │    loop chunks (~64KB each):
-  │      total_bytes += chunk.len()
-  │      if total_bytes > 1_073_741_824 → delete file, return 413
-  │      file.write_all(&chunk).await
-  │    file.flush().await
+  │  loop ~64KB chunks:
+  │    total_bytes += chunk.len()
+  │    if total_bytes > 1GB → delete partial file, return 413
+  │    write chunk to disk
+  │  flush + close
   │
-  ├──→ INSERT INTO videos (token, filename, ...)
+  ├── INSERT INTO videos (token, filename, ...)
   │
-  ├──→ HTTP 200 { token, share_url, stream_url }
-  │    ↑ Video is streamable at this exact moment.
+  ├── HTTP 200 { token, share_url, stream_url }
+  │          ↑ video is streamable right here
   │
-  └──→ tokio::spawn(transcode_to_hls(...))
-         Background. Response already sent.
-         On complete: UPDATE videos SET hls_ready = TRUE
+  └── tokio::spawn(transcode_to_hls(...))
+            runs concurrently, response already sent
+            on success: UPDATE videos SET hls_ready = TRUE
+            on failure: logs warning, hls_ready stays FALSE
 ```
 
-**Memory profile:** One chunk held in memory at a time (~64KB). A 1GB upload and a 1MB
-upload use identical peak RAM. See [benchmarks/RESULTS.md](../benchmarks/RESULTS.md).
+The 1GB check counts actual bytes received, not `Content-Length`. A client that lies
+about content length and streams more than 1GB gets cut off at 1GB regardless.
 
-### 4.2 Byte-Range Streaming
+### Byte-Range Streaming
 
 ```
-Browser <video src="/api/stream/a3f7bc12">
-  │  GET /api/stream/a3f7bc12
-  │  Range: bytes=0-1048575
-  ▼
-nginx  [proxy_buffering off]
-  ▼
-Axum
-  │  SELECT filename, content_type FROM videos WHERE token = ?
-  │  fs::metadata(file_path) → file_size
-  │  parse Range header → start, end
-  │  File::open(file_path)
-  │  file.seek(SeekFrom::Start(start))   ← O(1) seek
-  │  ReaderStream::new(file.take(chunk))
-  │
-  └──→ HTTP 206 Partial Content
-       Content-Range: bytes 0-1048575/{file_size}
-       Accept-Ranges: bytes
-       Cache-Control: public, max-age=3600
+GET /api/stream/a3f7bc12
+Range: bytes=37748736-38797311
 
--- User seeks to 02:30 --
-  GET /api/stream/a3f7bc12
-  Range: bytes=37748736-38797311
-  → file.seek(37748736) in O(1) — no re-download
+  SELECT filename, content_type FROM videos WHERE token = ?
+  File::open(file_path)
+  file.seek(SeekFrom::Start(37748736))    ← O(1), no scan
+  ReaderStream::new(file.take(1048576))
+
+  → HTTP 206 Partial Content
+    Content-Range: bytes 37748736-38797311/{file_size}
+    Accept-Ranges: bytes
+    Cache-Control: public, max-age=3600
 ```
 
-### 4.3 HLS Playlist (with Fallback)
+Seek to any offset in a 644MB file costs the same as seek to byte 0 — the OS kernel
+resolves the inode offset in constant time. Measured across 10 random seeks per file:
+average 1.6–3.4ms, flat from 5MB to 644MB (see benchmarks).
+
+### HLS Playlist (with Fallback)
 
 ```
 GET /api/hls/a3f7bc12/playlist.m3u8
 
-  SELECT hls_ready FROM videos WHERE token = ?
-
-  hls_ready = FALSE:
+  hls_ready = FALSE →
     HTTP 307 Temporary Redirect
     Location: /api/stream/a3f7bc12
-    Cache-Control: no-store          ← must not be cached (client re-checks next poll)
-    Player falls back to byte-range transparently
+    Cache-Control: no-store       ← critical: must not be cached
+    player follows redirect, plays byte-range
 
-  hls_ready = TRUE:
-    read /data/uploads/hls/a3f7bc12/playlist.m3u8
-    HTTP 200
-    Content-Type: application/vnd.apple.mpegurl
-    Cache-Control: no-cache
+  hls_ready = TRUE →
+    HTTP 200, Content-Type: application/vnd.apple.mpegurl
+    Cache-Control: no-cache       ← playlist must always be fresh
 ```
 
-### 4.4 Watch Page: Protocol Selection
+The `Cache-Control: no-store` on the 307 is important. Without it, a browser can
+cache the redirect and never re-check after HLS becomes ready — the player stays on
+byte-range forever. I hit this during testing and fixed it.
+
+### Watch Page Protocol Selection
+
+On load, the player fetches video metadata and picks a stream URL:
 
 ```
-onMount:
-  meta = fetch /api/videos/{token}
-  streamUrl = meta.hls_ready
-    ? /api/hls/{token}/playlist.m3u8
-    : /api/stream/{token}
-
-every 3 seconds (while !hls_ready):
-  meta = fetch /api/videos/{token}
-  if meta.hls_ready:
-    streamUrl = /api/hls/{token}/playlist.m3u8
-    stop polling
+meta.hls_ready ? /api/hls/{token}/playlist.m3u8 : /api/stream/{token}
 ```
 
-The status chip updates from "Direct stream" (amber) to "HLS ready" (green) without a
-page reload.
+While `hls_ready=false`, it polls the metadata endpoint every 3 seconds. When it
+flips, the `streamUrl` reactive variable updates and the player switches to HLS without
+a page reload. The status chip goes from amber ("Direct stream") to green ("HLS ready").
 
 ---
 
-## 5. Design Decisions
+## Design Decisions
 
-### 5.1 Serve raw file immediately; transcode async
+**Why serve raw file immediately and transcode async?**
+Because any mandatory processing step before playback violates time-to-stream.
+The alternative — transcode first, stream after — would mean waiting minutes for large
+files. Real-time HLS during upload (piping to FFmpeg stdin) was also considered but
+rejected: it couples upload and transcode into one pipeline, so a FFmpeg crash aborts
+the upload. The decoupled approach means a transcode failure is an invisible background
+degradation, not an upload failure.
 
-**Constraint:** Time-to-stream is the first priority.
+**Why `-c:v copy` instead of re-encoding?**
+Re-encoding at a reasonable quality (`libx264 medium`) takes roughly as long as the
+video's duration. A 15-minute film takes 15+ minutes to encode. Remuxing with
+`-c:v copy` copies the bitstream verbatim — it's I/O-bound, not CPU-bound. The cost
+is single output quality (no adaptive bitrate). Given the spec explicitly prioritises
+speed over quality, this is the right trade-off. ABR encoding belongs on a dedicated
+worker fleet, not the upload hot path — see ARCHITECTURE.md.
 
-**Decision:** File is streamable the moment the upload write flushes. HLS runs in
-`tokio::spawn` after the HTTP response is sent.
+**Why FFmpeg subprocess instead of Rust bindings (`ffmpeg-sys`)?**
+Isolation. The Rust ffmpeg bindings link against C libraries. A codec assertion failure
+or a bad input file can segfault the whole Axum process and take down the API for every
+active request. A subprocess crash is contained — FFmpeg dies, the handler logs a
+warning, the video falls back to byte-range. Also, `ffmpeg-sys` adds significant build
+complexity and compile time, which matters in Docker multi-stage builds.
 
-**Rejected — transcode first, stream after:** Adds mandatory latency of seconds to
-minutes before the video is watchable. Directly violates the primary constraint.
-
-**Rejected — real-time HLS during upload (pipe stdin):** Eliminates transcoding delay
-but couples upload and transcode into a single pipeline. A FFmpeg crash aborts the
-upload. The decoupled approach is more resilient.
-
----
-
-### 5.2 FFmpeg remux with `-c:v copy`
-
-**Constraint:** HLS must be ready in seconds, not minutes.
-
-**Decision:** `-c:v copy` copies the video bitstream verbatim into MPEG-TS segments
-without decoding or re-encoding. The operation is I/O-bound.
-
-```
-Remux time  ≈ file_size / disk_throughput  ≈ 500MB / ~80MB/s  ≈  6-8 seconds
-Re-encode   ≈ duration × encode_factor    ≈ 12min × 0.9×RT   ≈  10+ minutes
-```
-
-**Trade-off accepted:** Single output quality. No adaptive bitrate. The spec
-prioritises availability over quality, so this is correct.
-
-**Rejected — cloud transcoding (AWS MediaConvert, Cloudflare Stream):** External
-dependency, per-minute cost, network round-trip, incompatible with $0 goal.
-
----
-
-### 5.3 FFmpeg subprocess, not Rust bindings
-
-**Decision:** `tokio::process::Command::new("ffmpeg")`.
-
-**Rejected — ffmpeg-sys bindings:** A codec bug or assertion failure in a C library
-would segfault the Axum process, taking down the API for all users. A subprocess crash
-is isolated. `-c:v copy` makes the subprocess overhead negligible.
-
----
-
-### 5.4 `DefaultBodyLimit::disable()` on upload route only
-
-**Decision:** Per-route layer:
+**Why `DefaultBodyLimit::disable()` only on the upload route?**
+Axum applies a 2MB body limit globally by default. Without disabling it on the upload
+route, any file larger than 2MB fails with a multipart parse error before the handler
+sees a single byte. But disabling it globally removes protection from every other route.
+The solution is a per-route layer:
 
 ```rust
 .route("/api/upload", post(handlers::upload::upload_video)
     .layer(DefaultBodyLimit::disable()))
 ```
 
-Axum defaults to a 2MB body limit globally. Without this, files larger than 2MB fail
-with a multipart parse error before the handler sees a single byte. Disabling globally
-removes protection from all other routes. The 1GB limit is enforced in the handler by
-counting bytes as they arrive.
+The 1GB limit is then enforced manually in the handler as bytes arrive.
+
+**Why runtime SQLx queries instead of `query!` macros?**
+`sqlx::query!()` and `sqlx::query_as!()` validate SQL at compile time by connecting
+to a real database. That requires `DATABASE_URL` to be set during `cargo build`, which
+always fails in Docker multi-stage build containers where the database doesn't exist at
+build time. Runtime queries compile without a database. The downside is losing
+compile-time SQL validation — typos become runtime panics rather than build errors.
+Acceptable for four simple queries on a small schema.
+
+**Why SQLite path as `sqlite:///app/streamvault.db?mode=rwc`?**
+Two things worth noting here. Without `mode=rwc`, SQLite requires the file to already
+exist — on a fresh container start it doesn't, and the connection fails. The `rwc` flag
+creates it if absent. The absolute path matters too: relative paths resolve against the
+process CWD, which can differ from `WORKDIR` depending on runtime. I put the database
+at `/app/` specifically because `/data/` is a Docker volume mount — anything written
+inside a volume mount during image build is gone at container start. `/app/` is the
+workdir, never mounted, always writable.
+
+**Why SvelteKit with `adapter-static`?**
+Because at runtime there's no Node.js process — just nginx serving HTML/JS/CSS files.
+This eliminates a runtime service, reduces the attack surface, and means the frontend
+can be deployed to any CDN by copying the build output. SvelteKit's file-based routing
+maps cleanly to the two routes needed: `/` (home) and `/watch/[token]` (player).
+
+**Token format: 8 chars `[a-z0-9]`**
+36^8 ≈ 2.8 trillion combinations. Long enough that brute-force enumeration is
+impractical; short enough to share verbally. UUIDs were considered but they're longer
+than needed and ugly in URLs. Sequential integers were rejected outright — any user
+could walk the ID space and discover all videos.
 
 ---
 
-### 5.5 Runtime SQLx queries (not compile-time macros)
+## What the Benchmarks Showed
 
-**Decision:** `sqlx::query("...").bind(x).fetch_*()` with manual row mapping.
+Measured against real videos in `Demo_Testing/`. Full results in [benchmarks/RESULTS.md](../benchmarks/RESULTS.md).
 
-`sqlx::query_as!()` requires `DATABASE_URL` set at `cargo build` time and a live
-database to validate SQL against. This always fails in Docker multi-stage build
-containers. Runtime queries compile without a database.
+**Time-to-stream** came out at 1.1–7.3ms across all files from 5.3MB to 644MB. The
+variation is OS scheduling noise — there's no size dependency at all. The architecture
+works as intended here.
 
-**Trade-off accepted:** Compile-time SQL validation is lost. Column name typos become
-runtime errors. Acceptable for this schema size — the loss is mitigated by integration
-tests and a small number of queries.
+**HLS ready time** was the more interesting result. Small clips (5–100MB) were ready
+in 250–720ms. The 644MB `.mov` file was ready in 4.7s. But the 162–182MB Blender
+open movies took 9–13 seconds. That's counterintuitive until you look at what FFmpeg
+is actually doing: writing 300–450 individual segment files for 10-15 minute films.
+HLS time scales with video duration, not file size. This has a direct implication for
+production sizing — transcode workers should be allocated based on expected video length.
 
----
+**Seek latency** averaged 1.6–3.4ms across all files. The Sintel outlier (73.9ms max)
+happened while its own FFmpeg transcode was still writing segments to the same Docker
+volume — concurrent I/O contention. On a properly separated architecture (API reads
+from CDN, transcode writes to object storage), this doesn't occur.
 
-### 5.6 SQLite absolute path + `?mode=rwc`
-
-Without `mode=rwc`, SQLite requires the file to already exist. On first container start
-it doesn't — connection fails. `rwc` = read/write/create.
-
-Absolute path (`/app/streamvault.db`): relative paths resolve against process CWD,
-which can differ from `WORKDIR` in some runtimes. `/app/` is never a volume mount —
-any file created there survives container restarts.
-
----
-
-### 5.7 SvelteKit with `adapter-static`
-
-Outputs a fully pre-compiled static bundle. At runtime, nginx serves HTML/JS/CSS with
-no Node.js process. This eliminates an entire runtime service and enables trivial CDN
-deployment (just upload the build output to any CDN).
-
-**Key config:**
-- `ssr = false` in `+layout.ts` — SPA mode, client-side routing only
-- `fallback: 'index.html'` — nginx serves `index.html` for all unknown paths (handles `/watch/:token` deep links)
+**20 concurrent viewers** on Sintel (182MB): p95 = 131.6ms, max = 133.2ms. Tight
+distribution, no starvation. Tokio's async tasks handle concurrent reads well.
 
 ---
 
-### 5.8 Token generation
+## Edge Cases Worth Noting
 
-8 chars from `[a-z0-9]` → 36^8 ≈ **2.8 trillion** combinations.
+**Interrupted upload:** If the connection drops mid-upload, the multipart loop errors.
+The partial file is deleted before the error returns. The DB INSERT only runs on
+success, so no orphan token is created.
 
-**Rejected — UUID v4:** More entropy than needed, longer URLs.
-**Rejected — Sequential integers:** Enumerable — any user could walk the ID space.
+**FFmpeg not installed:** `transcode_to_hls()` returns `Ok(())` on any failure, including
+the binary not existing. HLS is an enhancement. The system works fine without it.
 
-At 1,000 uploads/second, the probability of a collision per insert is ~3.5 × 10⁻⁹.
-No uniqueness pre-check needed — SQLite's UNIQUE constraint catches the collision and
-returns a 500 (acceptable at this traffic level).
+**Codecs that can't remux to MPEG-TS:** Most H.264/H.265 files work with `-c:v copy`.
+Some containers (AVI with DivX, older ProRes variants) fail remux. Same outcome as
+above — byte-range fallback, no visible error.
+
+**Size limit bypass via spoofed Content-Length:** Not possible. The counter increments
+per actual chunk, not from headers.
+
+**Path traversal on HLS segments:** The segment handler rejects any name containing `/`
+or `..`. A request for `../../../etc/passwd` returns 400.
+
+**Token collision:** Probability ~3.5 × 10⁻⁷ at 1M videos. SQLite's UNIQUE constraint
+catches it and returns a 500. Low enough that a retry loop isn't implemented, but it's
+the correct next step.
 
 ---
 
-## 6. Performance Characteristics
+## Security Model
 
-Full benchmark methodology and results: [benchmarks/RESULTS.md](../benchmarks/RESULTS.md)
+Privacy here is token-based obscurity — possession of the token grants stream access.
+This is a deliberate choice given the spec excludes authentication. The token space
+makes brute-force impractical for personal use, but for a public deployment, rate
+limiting on the streaming endpoint would be necessary.
 
-### Summary Table
+What is implemented:
+- Path traversal protection on HLS segment names
+- 1GB limit enforced on actual bytes (not Content-Length)
+- Axum's default 2MB limit on all non-upload routes
+- MIME type validation against an explicit allowlist
+- `filename` stored separately from `original_name` — user input never touches file paths
 
-| Metric | Value | How it's achieved |
+What is not implemented and would be needed for public use:
+- Rate limiting on upload and stream endpoints
+- CORS restriction (currently `Any`)
+- Signed time-limited URLs for proper access control
+- Content scanning for malicious files
+
+---
+
+## Known Limitations
+
+| Limitation | Impact | Next step |
 |---|---|---|
-| Time-to-stream | < 20ms after upload | File on disk + DB row = streamable. No queue. |
-| HLS ready (50MB file) | ~0.6s | `-c:v copy` is I/O-bound, not CPU-bound |
-| HLS ready (500MB file) | ~8s | Linear with file size at disk throughput |
-| Seek latency | O(1), ~8-15ms | `file.seek(SeekFrom::Start(offset))` |
-| Upload RAM (1GB file) | ~64KB peak | Chunk-based write loop; chunk drops each iteration |
-| p95 response (20 viewers) | < 35ms | Tokio async tasks, not threads |
-
-### Why Seek Is O(1)
-
-The HTTP Range handler does exactly this:
-```rust
-if start > 0 {
-    file.seek(SeekFrom::Start(start)).await?;
-}
-```
-
-The OS kernel locates the file offset in O(1) via the inode. There is no scan.
-A seek to the middle of a 1GB file is identical in cost to a seek to byte 0.
-
-### Why HLS Segments Are Cached Aggressively
-
-```
-Cache-Control: public, max-age=86400, immutable
-```
-
-Segments are named `seg000.ts`, `seg001.ts` — they are written once and never modified.
-The `immutable` directive tells browsers and CDN edge nodes they will never change.
-On a CDN deployment, any segment served once is cached at the edge and never hits origin again.
-
-The playlist (`playlist.m3u8`) uses `Cache-Control: no-cache` — it must always be
-fresh because the `hls_ready` transition can happen at any point.
+| Single output quality (no ABR) | Slow connections may buffer on high-bitrate sources | ABR encode pass on worker fleet |
+| `duration_secs` always null | Incomplete metadata | FFprobe call after transcode |
+| No upload resume | Failed large uploads restart from zero | TUS protocol |
+| SQLite single writer | Contention above ~100 concurrent uploads | Change `DATABASE_URL` to PostgreSQL |
+| No video expiry | Storage grows indefinitely | `expires_at` column + cleanup job |
+| `/api/videos` no pagination | Slow query at 10K+ videos | Cursor-based: `WHERE created_at < ? LIMIT 20` |
+| DB wiped on `docker compose down -v` | Data loss on volume deletion | Mount `./data/db:/app` in compose |
+| HLS dirs not cleaned on transcode failure | Orphan directories accumulate | `remove_dir_all` in error path |
 
 ---
 
-## 7. Edge Cases & Failure Modes
-
-### 7.1 Upload interrupted mid-stream
-
-If the browser cancels the upload (network drop, user closes tab), Axum's multipart
-loop returns an error. The partial file is deleted:
-
-```rust
-if let Err(e) = result {
-    let _ = tokio::fs::remove_file(&file_path).await;
-    return Err(e);
-}
-```
-
-The database row is never inserted (the INSERT only runs after a successful write), so
-the token doesn't exist. The partial file doesn't linger.
-
-### 7.2 FFmpeg crashes or is not installed
-
-`transcode_to_hls()` returns `Ok(())` on any FFmpeg failure — it never propagates the
-error to the caller. The database row stays with `hls_ready=FALSE`. The video is fully
-watchable via byte-range streaming — HLS is an enhancement, not a dependency.
-
-If FFmpeg is not installed at all, `Command::new("ffmpeg")` fails immediately. Same
-outcome: graceful degradation to byte-range.
-
-### 7.3 File uploaded that remux fails (codec not supported by MPEG-TS)
-
-`-c:v copy` requires the codec to be valid inside MPEG-TS. Most H.264, H.265, VP9
-files work. Some containers (AVI with DivX, MOV with ProRes) may fail remux. Outcome:
-same as 7.2 — byte-range fallback, no error shown to user.
-
-For a production system, the resolution is an ABR encode pass as a fallback (slower
-but always produces valid HLS). See [ARCHITECTURE.md](./ARCHITECTURE.md).
-
-### 7.4 Size limit enforcement
-
-The 1GB limit is enforced as bytes arrive, not from the `Content-Length` header:
-
-```rust
-total_bytes += chunk.len();
-if total_bytes > MAX_UPLOAD_BYTES {
-    tokio::fs::remove_file(&file_path).await.ok();
-    return Err(AppError::PayloadTooLarge);
-}
-```
-
-This is important: `Content-Length` can be spoofed. A client that sends a forged
-`Content-Length: 100` but streams 2GB will still be rejected when the counter hits 1GB.
-
-### 7.5 Concurrent uploads
-
-Each upload is an independent Axum handler running on a Tokio task. Disk writes happen
-concurrently. SQLite WAL mode allows concurrent reads with one concurrent writer — if
-two uploads complete at the same instant, one INSERT blocks briefly (~1ms) while the
-other commits. This is not a correctness issue, only a minor throughput one.
-
-Above ~100 concurrent uploads, SQLite write contention becomes measurable. Resolution:
-PostgreSQL. See [ARCHITECTURE.md](./ARCHITECTURE.md).
-
-### 7.6 HLS segment path traversal
-
-The segment handler rejects any path containing `/` or `..`:
-
-```rust
-if segment.contains('/') || segment.contains("..") {
-    return Err(AppError::BadRequest("invalid segment name".into()));
-}
-```
-
-Without this, a request for `GET /api/hls/token/../../../etc/passwd` would construct a
-valid file path outside the upload directory.
-
-### 7.7 Token collision
-
-Tokens are generated from `rand::thread_rng()` (OS-seeded CSPRNG). Collision probability
-at 1M videos: ~3.5 × 10⁻⁷ per insert. SQLite's `UNIQUE` constraint on `token` catches
-a collision and returns a 500. A retry loop would be the correct fix; the current
-probability is low enough that it has not been implemented.
-
----
-
-## 8. Security Model
-
-**Privacy model:** Token-based obscurity. Possession of the 8-char token grants stream
-access. No authentication layer — the spec explicitly excludes it.
-
-| Vector | Mitigation | Notes |
-|---|---|---|
-| Path traversal (HLS segments) | Reject `/` and `..` in segment names | Implemented |
-| Oversized uploads | 1GB counter in handler + nginx `client_max_body_size 1100M` | Implemented |
-| Body stuffing on metadata routes | Axum default 2MB limit on all non-upload routes | Implemented |
-| MIME type spoofing | Allowlist validation against `content_type` field | Implemented |
-| Token enumeration | 2.8 trillion combinations | Sufficient for personal use; rate limiting needed for public |
-| CORS | Currently `Any` (all origins) | Must restrict to your domain for public deployment |
-| Malicious file content | None | Virus scanning (ClamAV) needed for public deployment |
-
-For hardening steps and the path to signed time-limited URLs, see
-[ARCHITECTURE.md §Security](./ARCHITECTURE.md#security).
-
----
-
-## 9. Observability
-
-### Current State
-
-Structured logging via the `tracing` crate:
-
-```
-2026-04-05T23:05:52Z  INFO streamvault: Uploaded demo.mp4 (52428800 bytes) → token=a3f7bc12
-2026-04-05T23:05:53Z  INFO streamvault::streaming: HLS transcode complete for token=a3f7bc12
-```
-
-HTTP request logging via `tower_http::TraceLayer`. Set `RUST_LOG=tower_http=debug` for
-per-request logs including method, path, status, and duration.
-
-### What's Missing and Why
-
-| Missing | Impact | Notes |
-|---|---|---|
-| Prometheus `/metrics` endpoint | No dashboards, no alerting | Easy to add — see ARCHITECTURE.md |
-| Distributed trace IDs | Can't correlate upload → transcode | Not needed at single-node scale |
-| Disk usage monitoring | Can't alert before disk full | Out of scope for $0 deployment |
-
----
-
-## 10. Known Limitations
-
-| Limitation | Root cause | Impact | Resolution |
-|---|---|---|---|
-| Single video quality | No ABR encode pass | Slow connections may buffer | ABR pass post-remux — see ARCHITECTURE.md |
-| `duration_secs` always null | FFprobe not called | Incomplete metadata | FFprobe after transcode |
-| `/api/videos` no pagination | No cursor implemented | Slow at 10,000+ videos | `WHERE created_at < ? LIMIT 20` |
-| SQLite write contention | Single writer | Degrades above ~100 concurrent uploads | Change `DATABASE_URL` to PostgreSQL |
-| DB lost on `docker compose down -v` | SQLite inside container | Data loss on volume wipe | Mount host path: `./data/db:/app` |
-| No upload resume | No TUS implementation | Large uploads restart on failure | TUS protocol |
-| No video expiry | No `expires_at` column | Storage grows indefinitely | Cron + TTL column |
-| HLS dirs not cleaned on transcode failure | No cleanup in error path | Orphan directories | `remove_dir_all` on error return |
-| Token collision no retry | No retry loop | 500 error at extremely low probability | Retry with new token on UNIQUE violation |
-
----
-
-*StreamVault · Rust · Axum · SQLite · Docker*
+*StreamVault · Rust · Axum · SQLite · FFmpeg · SvelteKit · Docker*

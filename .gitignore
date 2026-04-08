@@ -21,3 +21,6 @@ backend/uploads/
 .idea/
 .vscode/
 *.iml
+
+# Test videos (large files, not for version control)
+Demo_Testing/
