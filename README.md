@@ -20,6 +20,11 @@ A minimal private video streaming service. Upload any video file up to 1 GB and 
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
 
+**Documentation:**
+- [docs/DESIGN.md](docs/DESIGN.md) — how the current system works: request flows, design decisions, performance benchmarks, edge cases
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — production architecture: scaling path, deployment tiers, technology alternatives, cost analysis
+- [benchmarks/RESULTS.md](benchmarks/RESULTS.md) — measured performance: time-to-stream, HLS latency, seek characteristics, concurrent streaming
+
 ---
 
 ## Quick Start — Docker (Recommended)

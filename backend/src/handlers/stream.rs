@@ -118,6 +118,7 @@ pub async fn hls_playlist(
         return Ok(Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header(header::LOCATION, format!("/api/stream/{}", token))
+            .header(header::CACHE_CONTROL, "no-store")
             .body(Body::empty())
             .unwrap());
     }
