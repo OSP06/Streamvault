@@ -10,7 +10,6 @@ A minimal private video streaming service. Upload any video file up to 1 GB and 
 
 - [Quick Start — Docker](#quick-start--docker-recommended)
 - [Quick Start — No Docker](#quick-start--no-docker)
-- [Verify Everything Works](#verify-everything-works)
 - [Project Structure](#project-structure)
 - [Environment Variables](#environment-variables)
 - [API Reference](#api-reference)
@@ -193,45 +192,6 @@ Everything works identically to the Docker version:
 | `BIND_ADDR` | `0.0.0.0:3000` | TCP address (default, can omit) |
 
 > **Important:** `BASE_URL` must match the address people actually use to reach the backend. In no-Docker mode the frontend runs on `:5173` but the API is on `:3000`, so `BASE_URL=http://localhost:3000` is correct for local use. For the share link to work when sending to others, use your machine's LAN IP: `BASE_URL=http://192.168.1.x:3000`.
-
----
-
-## Verify Everything Works
-
-Run these checks after starting either the Docker or no-Docker setup. Replace `{token}` with the token returned by the upload step.
-
-```bash
-# 1. Backend health check
-curl http://localhost/health
-# Expected: {"status":"ok","service":"streamvault","version":"0.1.0"}
-# (Use :3000 instead of :80 if running without Docker)
-
-# 2. Upload a test video
-curl -X POST http://localhost/api/upload \
-  -F "video=@/path/to/your/video.mp4"
-# Expected: {"token":"abc12345","share_url":"...","stream_url":"...","size_bytes":...}
-
-# 3. Check video metadata (use the token from step 2)
-curl http://localhost/api/videos/{token}
-# Expected: JSON with hls_ready: false initially, then true after ~2 seconds
-
-# 4. Verify byte-range streaming works
-curl -I -H "Range: bytes=0-1023" http://localhost/api/stream/{token}
-# Expected: HTTP/1.1 206 Partial Content
-#           Accept-Ranges: bytes
-#           Content-Range: bytes 0-1023/...
-
-# 5. Once hls_ready is true, verify HLS playlist
-curl http://localhost/api/hls/{token}/playlist.m3u8
-# Expected: #EXTM3U header followed by segment entries
-#           (Returns 307 redirect to /api/stream/{token} if HLS not ready yet)
-
-# 6. List all videos
-curl http://localhost/api/videos
-# Expected: JSON array of video objects
-```
-
-> **Port note:** Docker exposes the app on port **80** (nginx). No-Docker runs the backend on **3000** and the frontend dev server on **5173**. Adjust all URLs above accordingly.
 
 ---
 
