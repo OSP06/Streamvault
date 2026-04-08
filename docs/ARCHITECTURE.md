@@ -745,32 +745,6 @@ Useful counters to add: `uploads_total`, `upload_bytes_total`, `stream_requests_
 
 > GET /api/videos returns all videos with no pagination or filtering. At 10,000 videos this query becomes slow. The fix is cursor-based pagination — WHERE created_at < ? ORDER BY created_at DESC LIMIT 20.
 
-
-### Roadmap
-
-**Before sharing publicly (P0):**
-- [ ] Rate limiting on upload endpoint
-- [ ] CORS restriction to your domain
-- [ ] Token expiry (`expires_at` column + enforcement)
-
-**Quality of life (P1):**
-- [ ] Video thumbnails (FFmpeg `-vframes 1` at 5 seconds)
-- [ ] Video duration in metadata (FFprobe after transcode)
-- [ ] Upload resume (TUS protocol)
-- [ ] Host-mounted database volume for persistence across `down -v`
-
-**Scale enablers (P2):**
-- [ ] Cloudflare R2 / S3 storage backend
-- [ ] Presigned download URLs
-- [ ] PostgreSQL (change `DATABASE_URL`)
-- [ ] ABR HLS (720p + 480p encode passes)
-
-**Operational (P3):**
-- [ ] Prometheus metrics endpoint
-- [ ] Structured request IDs
-- [ ] Transcode job queue (Redis) + worker binary
-- [ ] Automated cleanup job for expired videos
-
 ---
 
 *StreamVault · Rust · Axum · SQLite · Docker*
