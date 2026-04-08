@@ -34,10 +34,10 @@ a concrete resolution path.
 6. [Technology Choices & Alternatives](#6-technology-choices--alternatives)
 7. [Deployment Tiers](#7-deployment-tiers)
 8. [Scaling](#8-scaling)
-9. [The $1,000/Month Stack](#9-the-1000month-stack)
+9. [The $/Month Stack](#9-the-month-stack)
 10. [Security](#10-security)
 11. [Observability](#11-observability)
-12. [Known Issues & Roadmap](#12-known-issues--roadmap)
+12. [Known Issues](#12-known-issues)
 
 ---
 
@@ -593,7 +593,7 @@ Segments are immutable once written — ideal CDN cache objects:
 
 ---
 
-## 9. The $1,000/Month Stack
+## 9. The $/Month Stack
 
 Handles 5,000-10,000 concurrent viewers, multi-region, full observability.
 
